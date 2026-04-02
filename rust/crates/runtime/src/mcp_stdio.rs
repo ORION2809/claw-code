@@ -807,7 +807,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::ErrorKind;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -840,15 +839,22 @@ mod tests {
     fn write_echo_script() -> PathBuf {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("temp dir");
-        let script_path = root.join("echo-mcp.sh");
+        let script_path = root.join("echo-mcp.py");
         fs::write(
             &script_path,
-            "#!/bin/sh\nprintf 'READY:%s\\n' \"$MCP_TEST_TOKEN\"\nIFS= read -r line\nprintf 'ECHO:%s\\n' \"$line\"\n",
+            [
+                "#!/usr/bin/env python3",
+                "import os, sys",
+                r#"sys.stdout.buffer.write(f"READY:{os.environ.get('MCP_TEST_TOKEN', '')}\n".encode())"#,
+                "sys.stdout.buffer.flush()",
+                "line = sys.stdin.readline()",
+                r#"sys.stdout.buffer.write(f"ECHO:{line.rstrip()}\n".encode())"#,
+                "sys.stdout.buffer.flush()",
+                "",
+            ]
+            .join("\n"),
         )
         .expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
 
@@ -888,9 +894,6 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
 
@@ -1014,9 +1017,6 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
 
@@ -1118,9 +1118,6 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
 
@@ -1128,7 +1125,7 @@ mod tests {
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "/bin/sh".to_string(),
+                command: python_command(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
             }),
@@ -1163,8 +1160,12 @@ mod tests {
     }
 
     fn cleanup_script(script_path: &Path) {
-        fs::remove_file(script_path).expect("cleanup script");
-        fs::remove_dir_all(script_path.parent().expect("script parent")).expect("cleanup dir");
+        if let Err(error) = fs::remove_file(script_path) {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "cleanup script");
+        }
+        if let Err(error) = fs::remove_dir_all(script_path.parent().expect("script parent")) {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "cleanup dir");
+        }
     }
 
     fn manager_server_config(
@@ -1320,7 +1321,7 @@ mod tests {
         runtime.block_on(async {
             let script_path = write_echo_script();
             let transport = crate::mcp_client::McpStdioTransport {
-                command: "/bin/sh".to_string(),
+                command: python_command(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "direct-secret".to_string())]),
             };

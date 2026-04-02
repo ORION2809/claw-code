@@ -1,157 +1,95 @@
-# 🦞 Claw Code — Rust Implementation
+# Claw Code Rust Workspace
 
-A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for speed, safety, and native tool execution.
+This directory contains the primary Rust implementation for the `claw` CLI. It is the main product surface for the repository and includes the merged upstream workspace shape plus the local multi-provider and runtime extensions.
 
-## Quick Start
+## Build and run
 
 ```bash
-# Build
-cd rust/
 cargo build --release
 
-# Run interactive REPL
 ./target/release/claw
-
-# One-shot prompt
-./target/release/claw prompt "explain this codebase"
-
-# With specific model
-./target/release/claw --model sonnet prompt "fix the bug in main.rs"
+./target/release/claw prompt "explain crates/runtime"
+./target/release/claw --model sonnet "review the latest changes"
+./target/release/claw login
 ```
 
-## Configuration
-
-Set your API credentials:
+You can also install the binary locally:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-# Or use a proxy
-export ANTHROPIC_BASE_URL="https://your-proxy.com"
+cargo install --path crates/claw-cli --locked
 ```
 
-Or authenticate via OAuth:
+## Provider setup
+
+Anthropic-compatible:
 
 ```bash
-claw login
+export ANTHROPIC_API_KEY="..."
+export ANTHROPIC_BASE_URL="https://api.anthropic.com"
 ```
 
-## Features
+Grok:
 
-| Feature | Status |
-|---------|--------|
-| Multi-provider API (Claude, Grok, OpenAI) | ✅ |
-| API + SSE streaming | ✅ |
-| OAuth login/logout | ✅ |
-| Interactive REPL (rustyline) | ✅ |
-| Tool system (bash, read, write, edit, grep, glob) | ✅ |
-| Web tools (search, fetch) | ✅ |
-| Sub-agent orchestration | ✅ |
-| Todo tracking | ✅ |
-| Notebook editing | ✅ |
-| CLAW.md / project memory | ✅ |
-| Config file hierarchy (.claw.json) | ✅ |
-| Permission system (context-aware + rules) | ✅ |
-| Hook system (Pre/Post ToolUse + abort signals) | ✅ |
-| Hook progress reporting | ✅ |
-| Plugin system with PluginRegistry | ✅ |
-| Auto-compaction (200K token threshold) | ✅ |
-| RegisteredTool abstraction (Builtin + Plugin) | ✅ |
-| MCP server lifecycle | ✅ |
-| Session persistence + resume | ✅ |
-| Extended thinking (thinking blocks) | ✅ |
-| Cost tracking + usage display | ✅ |
-| Git integration | ✅ |
-| Markdown terminal rendering (ANSI) | ✅ |
-| Model aliases (opus/sonnet/haiku) | ✅ |
-| Slash commands (/status, /compact, /clear, etc.) | ✅ |
-| Skills registry | ✅ |
-
-## Model Aliases
-
-Short names resolve to the latest model versions:
-
-| Alias | Resolves To |
-|-------|------------|
-| `opus` | `claude-opus-4-6` |
-| `sonnet` | `claude-sonnet-4-6` |
-| `haiku` | `claude-haiku-4-5-20251213` |
-
-## CLI Flags
-
-```
-claw [OPTIONS] [COMMAND]
-
-Options:
-  --model MODEL                    Set the model (alias or full name)
-  --dangerously-skip-permissions   Skip all permission checks
-  --permission-mode MODE           Set read-only, workspace-write, or danger-full-access
-  --allowedTools TOOLS             Restrict enabled tools
-  --output-format FORMAT           Output format (text or json)
-  --version, -V                    Print version info
-
-Commands:
-  prompt <text>      One-shot prompt (non-interactive)
-  login              Authenticate via OAuth
-  logout             Clear stored credentials
-  init               Initialize project config
-  doctor             Check environment health
-  self-update        Update to latest version
+```bash
+export XAI_API_KEY="..."
+export XAI_BASE_URL="https://api.x.ai"
 ```
 
-## Slash Commands (REPL)
+OpenAI-compatible:
 
-| Command | Description |
-|---------|-------------|
-| `/help` | Show help |
-| `/status` | Show session status (model, tokens, cost) |
-| `/cost` | Show cost breakdown |
-| `/compact` | Compact conversation history |
-| `/clear` | Clear conversation |
-| `/model [name]` | Show or switch model |
-| `/permissions` | Show or switch permission mode |
-| `/config [section]` | Show config (env, hooks, model) |
-| `/memory` | Show CLAW.md contents |
-| `/diff` | Show git diff |
-| `/export [path]` | Export conversation |
-| `/session [id]` | Resume a previous session |
-| `/version` | Show version |
-
-## Workspace Layout
-
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
+
+## Workspace crates
+
+```text
 rust/
-├── Cargo.toml              # Workspace root
-├── Cargo.lock
-└── crates/
-    ├── api/                # API client + SSE streaming
-    ├── commands/           # Shared slash-command registry
-    ├── compat-harness/     # TS manifest extraction harness
-    ├── runtime/            # Session, config, permissions, MCP, prompts
-    ├── claw-cli/   # Main CLI binary (`claw`)
-    └── tools/              # Built-in tool implementations
+|-- Cargo.toml
+|-- Cargo.lock
+|-- docs/releases/0.1.0.md
+`-- crates/
+    |-- api/              # Provider clients, auth, streaming
+    |-- claw-cli/         # User-facing `claw` binary
+    |-- commands/         # Slash command registry and helpers
+    |-- compat-harness/   # Compatibility tooling
+    |-- lsp/              # LSP support helpers and types
+    |-- plugins/          # Plugin discovery, registry, lifecycle
+    |-- runtime/          # Sessions, config, permissions, prompts, MCP
+    |-- server/           # HTTP and SSE server surface
+    `-- tools/            # Built-in tool implementations
 ```
 
-### Crate Responsibilities
+## Crate responsibilities
 
-- **api** — HTTP client, SSE stream parser, request/response types, auth (API key + OAuth bearer)
-- **commands** — Slash command definitions and help text generation
-- **compat-harness** — Extracts tool/prompt manifests from upstream TS source
-- **runtime** — `ConversationRuntime` agentic loop, `ConfigLoader` hierarchy, `Session` persistence, permission policy, MCP client, system prompt assembly, usage tracking
-- **claw-cli** — REPL, one-shot prompt, streaming display, tool call rendering, CLI argument parsing
-- **tools** — Tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, REPL runtimes
+- `api`: provider selection, authentication, request and response types, SSE streaming
+- `claw-cli`: CLI parsing, REPL loop, one-shot prompt mode, session UX, rendering
+- `commands`: slash command definitions, help rendering, command suggestions
+- `compat-harness`: compatibility support for upstream manifest extraction
+- `lsp`: language-server support helpers and shared types
+- `plugins`: plugin discovery, registry handling, lifecycle management
+- `runtime`: conversation loop, config loading, permissions, hooks, prompts, MCP, usage, sessions
+- `server`: HTTP and SSE serving surface for integration use cases
+- `tools`: built-in tool specs and execution for shell, file, search, web, agent, todo, notebook, and skill flows
 
-## Stats
+## Current capabilities
 
-- **~20K lines** of Rust
-- **7 crates** in workspace (api, claw-cli, commands, compat-harness, plugins, runtime, tools)
-- **Binary name:** `claw`
-- **Default model:** `claude-opus-4-6`
-- **Default permissions:** `danger-full-access`
+- Interactive REPL and non-interactive prompt execution
+- Resume-safe slash commands and saved session inspection
+- Multi-provider model support and OAuth login
+- Built-in tool execution with plugin-aware registration
+- Hook progress, abort, and failure reporting
+- Context-aware permission rules
+- Auto-compaction, usage reporting, and session persistence
+- Workspace-aware instruction loading through `CLAW.md`
+
+## Notes
+
+- This workspace currently builds from source; packaged public releases are still limited.
+- Release notes for the current workspace live in `docs/releases/0.1.0.md`.
+- The default binary name is `claw`.
 
 ## Maintainer
 
-Maintained by [ORION2809](https://github.com/ORION2809). Forked from [instructkr/claw-code](https://github.com/instructkr/claw-code).
-
-## License
-
-See repository root.
+Maintained by [ORION2809](https://github.com/ORION2809). Derived from [instructkr/claw-code](https://github.com/instructkr/claw-code).

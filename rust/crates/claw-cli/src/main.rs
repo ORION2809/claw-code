@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,14 +16,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, ClawApiClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    resolve_startup_auth_source, AuthSource, ClawApiClient, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
     handle_agents_slash_command, handle_plugins_slash_command, handle_skills_slash_command,
-    render_slash_command_help, resume_supported_slash_commands, slash_command_specs, SlashCommand,
+    render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
+    suggest_slash_commands, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -59,13 +60,23 @@ type AllowedToolSet = BTreeSet<String>;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!(
-            "error: {error}
-
-Run `claw --help` for usage."
-        );
+        eprintln!("{}", render_cli_error(&error.to_string()));
         std::process::exit(1);
     }
+}
+
+fn render_cli_error(problem: &str) -> String {
+    let mut lines = vec!["Error".to_string()];
+    for (index, line) in problem.lines().enumerate() {
+        let label = if index == 0 {
+            "  Problem          "
+        } else {
+            "                   "
+        };
+        lines.push(format!("{label}{line}"));
+    }
+    lines.push("  Help             claw --help".to_string());
+    lines.join("\n")
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -321,15 +332,50 @@ fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
         Some(SlashCommand::Help) => Ok(CliAction::Help),
         Some(SlashCommand::Agents { args }) => Ok(CliAction::Agents { args }),
         Some(SlashCommand::Skills { args }) => Ok(CliAction::Skills { args }),
-        Some(command) => Err(format!(
-            "unsupported direct slash command outside the REPL: {command_name}",
-            command_name = match command {
+        Some(command) => Err(format_direct_slash_command_error(
+            match &command {
                 SlashCommand::Unknown(name) => format!("/{name}"),
                 _ => rest[0].clone(),
             }
+            .as_str(),
+            matches!(command, SlashCommand::Unknown(_)),
         )),
         None => Err(format!("unknown subcommand: {}", rest[0])),
     }
+}
+
+fn format_direct_slash_command_error(command: &str, is_unknown: bool) -> String {
+    let trimmed = command.trim().trim_start_matches('/');
+    let mut lines = vec![
+        "Direct slash command unavailable".to_string(),
+        format!("  Command          /{trimmed}"),
+    ];
+    if is_unknown {
+        append_slash_command_suggestions(&mut lines, trimmed);
+    } else {
+        lines.push("  Try              Start `claw` to use interactive slash commands".to_string());
+        lines.push(
+            "  Tip              Resume-safe commands also work with `claw --resume SESSION.json ...`"
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
+
+fn append_slash_command_suggestions(lines: &mut Vec<String>, name: &str) {
+    let suggestions = suggest_slash_commands(name, 3);
+    if suggestions.is_empty() {
+        lines.push("  Try              /help shows the full slash command map".to_string());
+        return;
+    }
+
+    lines.push("  Try              /help shows the full slash command map".to_string());
+    lines.push("Suggestions".to_string());
+    lines.extend(
+        suggestions
+            .into_iter()
+            .map(|suggestion| format!("  {suggestion}")),
+    );
 }
 
 fn resolve_model_alias(model: &str) -> &str {
@@ -670,12 +716,19 @@ struct StatusUsage {
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Model
+  Current          {model}
+  Session          {message_count} messages Â· {turns} turns
   Current model    {model}
   Session messages {message_count}
-  Session turns    {turns}
 
-Usage
-  Inspect current model with /model
+Aliases
+  opus             claude-opus-4-6
+  sonnet           claude-sonnet-4-6
+  haiku            claude-haiku-4-5-20251213
+
+Next
+  /model           Show the current model
+  /model <name>    Switch models for this REPL session
   Switch models with /model <name>"
     )
 }
@@ -685,7 +738,9 @@ fn format_model_switch_report(previous: &str, next: &str, message_count: usize) 
         "Model updated
   Previous         {previous}
   Current          {next}
-  Preserved msgs   {message_count}"
+  Preserved        {message_count} messages
+  Preserved msgs   {message_count}
+  Tip              Existing conversation context stayed attached"
     )
 }
 
@@ -705,33 +760,33 @@ fn format_permissions_report(mode: &str) -> String {
     ]
     .into_iter()
     .map(|(name, description, is_current)| {
-        let marker = if is_current {
-            "● current"
-        } else {
-            "○ available"
-        };
-        format!("  {name:<18} {marker:<11} {description}")
+        let status = if is_current { "current" } else { "available" };
+        format!("  {name:<18} {status:<11} {description}")
     })
     .collect::<Vec<_>>()
-    .join(
-        "
-",
-    );
+    .join("\n");
+
+    let effect = match mode {
+        "read-only" => "Only read/search tools can run automatically",
+        "workspace-write" => "Editing tools can modify files in the workspace",
+        "danger-full-access" => "All tools can run without additional sandbox limits",
+        _ => "Unknown permission mode",
+    };
 
     format!(
         "Permissions
   Active mode      {mode}
   Mode status      live session default
+  Effect           {effect}
 
 Modes
 {modes}
 
-Usage
-  Inspect current mode with /permissions
-  Switch modes with /permissions <mode>"
+Next
+  /permissions              Show the current mode
+  /permissions <mode>       Switch modes for subsequent tool calls"
     )
 }
-
 fn format_permissions_switch_report(previous: &str, next: &str) -> String {
     format!(
         "Permissions updated
@@ -739,7 +794,8 @@ fn format_permissions_switch_report(previous: &str, next: &str) -> String {
   Previous mode    {previous}
   Active mode      {next}
   Applies to       subsequent tool calls
-  Usage            /permissions to inspect current mode"
+  Applies to       Subsequent tool calls in this REPL
+  Tip              Run /permissions to review all available modes"
     )
 }
 
@@ -750,7 +806,11 @@ fn format_cost_report(usage: TokenUsage) -> String {
   Output tokens    {}
   Cache create     {}
   Cache read       {}
-  Total tokens     {}",
+  Total tokens     {}
+
+Next
+  /status          See session + workspace context
+  /compact         Trim local history if the session is getting large",
         usage.input_tokens,
         usage.output_tokens,
         usage.cache_creation_input_tokens,
@@ -767,8 +827,8 @@ fn format_resume_report(session_path: &str, message_count: usize, turns: u32) ->
     format!(
         "Session resumed
   Session file     {session_path}
-  Messages         {message_count}
-  Turns            {turns}"
+  History          {message_count} messages Ã‚Â· {turns} turns
+  Next             /status Ã‚Â· /diff Ã‚Â· /export"
     )
 }
 
@@ -777,7 +837,7 @@ fn format_compact_report(removed: usize, resulting_messages: usize, skipped: boo
         format!(
             "Compact
   Result           skipped
-  Reason           session below compaction threshold
+  Reason           Session is already below the compaction threshold
   Messages kept    {resulting_messages}"
         )
     } else {
@@ -785,7 +845,8 @@ fn format_compact_report(removed: usize, resulting_messages: usize, skipped: boo
             "Compact
   Result           compacted
   Messages removed {removed}
-  Messages kept    {resulting_messages}"
+  Messages kept    {resulting_messages}
+  Tip              Use /status to review the trimmed session"
         )
     }
 }
@@ -943,6 +1004,9 @@ fn run_resume_command(
             })
         }
         SlashCommand::Bughunter { .. }
+        | SlashCommand::Branch { .. }
+        | SlashCommand::Worktree { .. }
+        | SlashCommand::CommitPushPr { .. }
         | SlashCommand::Commit
         | SlashCommand::Pr { .. }
         | SlashCommand::Issue { .. }
@@ -970,11 +1034,11 @@ fn run_repl(
     loop {
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
-                let trimmed = input.trim().to_string();
+                let trimmed = input.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                if matches!(trimmed, "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
                 }
@@ -984,8 +1048,8 @@ fn run_repl(
                     }
                     continue;
                 }
-                editor.push_history(input);
-                cli.run_turn(&trimmed)?;
+                editor.push_history(&input);
+                cli.run_turn(trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -1108,28 +1172,65 @@ impl LiveCli {
     }
 
     fn startup_banner(&self) -> String {
-        let cwd = env::current_dir().map_or_else(
-            |_| "<unknown>".to_string(),
+        let color = io::stdout().is_terminal();
+        let cwd = env::current_dir().ok();
+        let cwd_display = cwd.as_ref().map_or_else(
+            || "<unknown>".to_string(),
             |path| path.display().to_string(),
         );
-        format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[2mShift+Enter\x1b[0m for newline",
-            self.model,
-            self.permission_mode.as_str(),
-            cwd,
-            self.session.id,
-        )
+        let workspace_name = cwd
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        let git_branch = status_context(Some(&self.session.path))
+            .ok()
+            .and_then(|context| context.git_branch);
+        let workspace_summary = git_branch.as_deref().map_or_else(
+            || workspace_name.to_string(),
+            |branch| format!("{workspace_name} Â· {branch}"),
+        );
+        let has_claw_md = cwd
+            .as_ref()
+            .is_some_and(|path| path.join("CLAW.md").is_file());
+        let mut lines = vec![
+            format!(
+                "{} {}",
+                if color {
+                    "\x1b[1;38;5;45mðŸ¦ž Claw Code\x1b[0m"
+                } else {
+                    "Claw Code"
+                },
+                if color {
+                    "\x1b[2mÂ· ready\x1b[0m"
+                } else {
+                    "Â· ready"
+                }
+            ),
+            format!("  Workspace        {workspace_summary}"),
+            format!("  Directory        {cwd_display}"),
+            format!("  Model            {}", self.model),
+            format!("  Permissions      {}", self.permission_mode.as_str()),
+            format!("  Session          {}", self.session.id),
+            format!(
+                "  Quick start      {}",
+                if has_claw_md {
+                    "/help Â· /status Â· ask for a task"
+                } else {
+                    "/init Â· /help Â· /status"
+                }
+            ),
+            "  Editor           Tab completes slash commands Â· /vim toggles modal editing"
+                .to_string(),
+            "  Multiline        Shift+Enter or Ctrl+J inserts a newline".to_string(),
+        ];
+        if !has_claw_md {
+            lines.push(
+                "  First run        /init scaffolds CLAW.md, .claw.json, and local session files"
+                    .to_string(),
+            );
+        }
+        lines.join("\n")
     }
 
     fn prepare_turn_runtime(
@@ -1164,7 +1265,7 @@ impl LiveCli {
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
-            "🦀 Thinking...",
+            "ðŸ¦€ Thinking...",
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
@@ -1175,7 +1276,7 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 spinner.finish(
-                    "✨ Done",
+                    "âœ¨ Done",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -1191,7 +1292,7 @@ impl LiveCli {
             }
             Err(error) => {
                 spinner.fail(
-                    "❌ Request failed",
+                    "âŒ Request failed",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -1333,8 +1434,29 @@ impl LiveCli {
                 Self::print_skills(args.as_deref())?;
                 false
             }
+            SlashCommand::Branch { .. } => {
+                eprintln!(
+                    "{}",
+                    render_mode_unavailable("branch", "git branch commands")
+                );
+                false
+            }
+            SlashCommand::Worktree { .. } => {
+                eprintln!(
+                    "{}",
+                    render_mode_unavailable("worktree", "git worktree commands")
+                );
+                false
+            }
+            SlashCommand::CommitPushPr { .. } => {
+                eprintln!(
+                    "{}",
+                    render_mode_unavailable("commit-push-pr", "commit + push + PR automation")
+                );
+                false
+            }
             SlashCommand::Unknown(name) => {
-                eprintln!("unknown slash command: /{name}");
+                eprintln!("{}", render_unknown_repl_command(&name));
                 false
             }
         })
@@ -1913,6 +2035,20 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
     Ok(sessions)
 }
 
+fn format_relative_timestamp(epoch_secs: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(epoch_secs);
+    let elapsed = now.saturating_sub(epoch_secs);
+    match elapsed {
+        0..=59 => format!("{elapsed}s ago"),
+        60..=3_599 => format!("{}m ago", elapsed / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed / 3_600),
+        _ => format!("{}d ago", elapsed / 86_400),
+    }
+}
+
 fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
     let sessions = list_managed_sessions()?;
     let mut lines = vec![
@@ -1925,37 +2061,73 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
     }
     for session in sessions {
         let marker = if session.id == active_session_id {
-            "● current"
+            "â— current"
         } else {
-            "○ saved"
+            "â—‹ saved"
         };
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified} path={path}",
+            "  {id:<20} {marker:<10} {msgs:>3} msgs · updated {modified}",
             id = session.id,
             msgs = session.message_count,
-            modified = session.modified_epoch_secs,
-            path = session.path.display(),
+            modified = format_relative_timestamp(session.modified_epoch_secs),
         ));
+        lines.push(format!("    {}", session.path.display()));
     }
     Ok(lines.join("\n"))
 }
 
 fn render_repl_help() -> String {
     [
-        "REPL".to_string(),
+        "Interactive REPL".to_string(),
+        "  /help                Browse the full slash command map".to_string(),
+        "  /status              Inspect session + workspace state".to_string(),
+        "  /model <name>        Switch models mid-session".to_string(),
+        "  /permissions <mode>  Adjust tool access".to_string(),
         "  /exit                Quit the REPL".to_string(),
         "  /quit                Quit the REPL".to_string(),
-        "  Up/Down              Navigate prompt history".to_string(),
+        "  Up/Down              Recall previous prompts".to_string(),
         "  Tab                  Complete slash commands".to_string(),
+        "  /vim                 Toggle modal editing".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         String::new(),
         render_slash_command_help(),
     ]
-    .join(
-        "
-",
-    )
+    .join("\n")
+}
+fn render_unknown_repl_command(name: &str) -> String {
+    let mut lines = vec![
+        "Unknown slash command".to_string(),
+        format!("  Command          /{name}"),
+    ];
+    append_repl_command_suggestions(&mut lines, name);
+    lines.join("\n")
+}
+
+fn append_repl_command_suggestions(lines: &mut Vec<String>, name: &str) {
+    let suggestions = suggest_repl_commands(name);
+    if suggestions.is_empty() {
+        lines.push("  Try              /help shows the full slash command map".to_string());
+        return;
+    }
+
+    lines.push("  Try              /help shows the full slash command map".to_string());
+    lines.push("Suggestions".to_string());
+    lines.extend(
+        suggestions
+            .into_iter()
+            .map(|suggestion| format!("  {suggestion}")),
+    );
+}
+
+fn render_mode_unavailable(command: &str, label: &str) -> String {
+    [
+        "Command unavailable in this REPL mode".to_string(),
+        format!("  Command          /{command}"),
+        format!("  Feature          {label}"),
+        "  Tip              Use /help to find currently wired REPL commands".to_string(),
+    ]
+    .join("\n")
 }
 
 fn status_context(
@@ -1988,32 +2160,54 @@ fn format_status_report(
     [
         format!(
             "Status
+Session
   Model            {model}
+  Permissions      {permission_mode}
   Permission mode  {permission_mode}
+  Activity         {} messages Â· {} turns
   Messages         {}
-  Turns            {}
-  Estimated tokens {}",
-            usage.message_count, usage.turns, usage.estimated_tokens,
+  Tokens           est {} Â· latest {} Â· total {}
+  Current model    {model}
+  Session messages {}
+  Latest total     {}",
+            usage.message_count,
+            usage.turns,
+            usage.message_count,
+            usage.estimated_tokens,
+            usage.latest.total_tokens(),
+            usage.cumulative.total_tokens(),
+            usage.message_count,
+            usage.latest.total_tokens(),
         ),
         format!(
             "Usage
-  Latest total     {}
   Cumulative input {}
   Cumulative output {}
-  Cumulative total {}",
-            usage.latest.total_tokens(),
+  Cumulative total {}
+  Cache create     {}
+  Cache read       {}",
             usage.cumulative.input_tokens,
             usage.cumulative.output_tokens,
             usage.cumulative.total_tokens(),
+            usage.cumulative.cache_creation_input_tokens,
+            usage.cumulative.cache_read_input_tokens,
         ),
         format!(
             "Workspace
+  Folder           {}
   Cwd              {}
   Project root     {}
   Git branch       {}
+  Session file     {}
   Session          {}
   Config files     loaded {}/{}
-  Memory files     {}",
+  Memory files     {}
+
+Next
+  /help            Browse commands
+  /model           Switch models
+  /permissions     Change permissions",
+            context.cwd.display(),
             context.cwd.display(),
             context
                 .project_root
@@ -2022,18 +2216,18 @@ fn format_status_report(
             context.git_branch.as_deref().unwrap_or("unknown"),
             context.session_path.as_ref().map_or_else(
                 || "live-repl".to_string(),
-                |path| path.display().to_string()
+                |path| path.display().to_string(),
+            ),
+            context.session_path.as_ref().map_or_else(
+                || "live-repl".to_string(),
+                |path| path.display().to_string(),
             ),
             context.loaded_config_files,
             context.discovered_config_files,
             context.memory_file_count,
         ),
     ]
-    .join(
-        "
-
-",
-    )
+    .join("\n\n")
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -2128,8 +2322,7 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     if project_context.instruction_files.is_empty() {
         lines.push("Discovered files".to_string());
         lines.push(
-            "  No CLAW instruction files discovered in the current directory ancestry."
-                .to_string(),
+            "  No CLAW instruction files discovered in the current directory ancestry.".to_string(),
         );
     } else {
         lines.push("Discovered files".to_string());
@@ -2374,7 +2567,7 @@ fn truncate_for_prompt(value: &str, limit: usize) -> String {
         value.trim().to_string()
     } else {
         let truncated = value.chars().take(limit).collect::<String>();
-        format!("{}\n…[truncated]", truncated.trim_end())
+        format!("{}\nâ€¦[truncated]", truncated.trim_end())
     }
 }
 
@@ -2496,8 +2689,7 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     )?)
 }
 
-fn build_runtime_plugin_state(
-) -> Result<
+fn build_runtime_plugin_state() -> Result<
     (
         runtime::RuntimeFeatureConfig,
         PluginRegistry,
@@ -2510,8 +2702,7 @@ fn build_runtime_plugin_state(
     let runtime_config = loader.load()?;
     let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
-    let tool_registry =
-        GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?;
+    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?;
     Ok((
         runtime_config.feature_config().clone(),
         plugin_registry,
@@ -2798,27 +2989,27 @@ fn format_internal_prompt_progress_line(
     {
         status_bits.push(detail.to_string());
     }
-    let status = status_bits.join(" · ");
+    let status = status_bits.join(" Â· ");
     match event {
         InternalPromptProgressEvent::Started => {
             format!(
-                "🧭 {} status · planning started · {status}",
+                "ðŸ§­ {} status Â· planning started Â· {status}",
                 snapshot.command_label
             )
         }
         InternalPromptProgressEvent::Update => {
-            format!("… {} status · {status}", snapshot.command_label)
+            format!("â€¦ {} status Â· {status}", snapshot.command_label)
         }
         InternalPromptProgressEvent::Heartbeat => format!(
-            "… {} heartbeat · {elapsed_seconds}s elapsed · {status}",
+            "â€¦ {} heartbeat Â· {elapsed_seconds}s elapsed Â· {status}",
             snapshot.command_label
         ),
         InternalPromptProgressEvent::Complete => format!(
-            "✔ {} status · completed · {elapsed_seconds}s elapsed · {} steps total",
+            "âœ” {} status Â· completed Â· {elapsed_seconds}s elapsed Â· {} steps total",
             snapshot.command_label, snapshot.step
         ),
         InternalPromptProgressEvent::Failed => format!(
-            "✘ {} status · failed · {elapsed_seconds}s elapsed · {}",
+            "âœ˜ {} status Â· failed Â· {elapsed_seconds}s elapsed Â· {}",
             snapshot.command_label,
             error.unwrap_or("unknown error")
         ),
@@ -2894,7 +3085,8 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
-) -> Result<ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>> {
+) -> Result<ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
+{
     let (feature_config, plugin_registry, tool_registry) = build_runtime_plugin_state()?;
     let mut runtime = ConversationRuntime::new_with_plugins(
         session,
@@ -2920,6 +3112,14 @@ fn build_runtime(
 
 struct CliHookProgressReporter;
 
+fn hook_event_name(event: runtime::HookEvent) -> &'static str {
+    match event {
+        runtime::HookEvent::PreToolUse => "PreToolUse",
+        runtime::HookEvent::PostToolUse => "PostToolUse",
+        runtime::HookEvent::PostToolUseFailure => "PostToolUseFailure",
+    }
+}
+
 impl runtime::HookProgressReporter for CliHookProgressReporter {
     fn on_event(&mut self, event: &runtime::HookProgressEvent) {
         match event {
@@ -2929,7 +3129,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 command,
             } => eprintln!(
                 "[hook {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
+                event_name = hook_event_name(*event)
             ),
             runtime::HookProgressEvent::Completed {
                 event,
@@ -2937,7 +3137,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 command,
             } => eprintln!(
                 "[hook done {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
+                event_name = hook_event_name(*event)
             ),
             runtime::HookProgressEvent::Cancelled {
                 event,
@@ -2945,7 +3145,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 command,
             } => eprintln!(
                 "[hook cancelled {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
+                event_name = hook_event_name(*event)
             ),
         }
     }
@@ -3243,7 +3443,7 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
 }
 
 fn slash_command_completion_candidates() -> Vec<String> {
-    slash_command_specs()
+    let mut candidates = slash_command_specs()
         .iter()
         .flat_map(|spec| {
             std::iter::once(spec.name)
@@ -3251,7 +3451,69 @@ fn slash_command_completion_candidates() -> Vec<String> {
                 .map(|name| format!("/{name}"))
                 .collect::<Vec<_>>()
         })
+        .collect::<Vec<_>>();
+    candidates.extend([
+        String::from("/vim"),
+        String::from("/exit"),
+        String::from("/quit"),
+    ]);
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn suggest_repl_commands(name: &str) -> Vec<String> {
+    let normalized = name.trim().trim_start_matches('/').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranked = slash_command_completion_candidates()
+        .into_iter()
+        .filter_map(|candidate| {
+            let raw = candidate.trim_start_matches('/').to_ascii_lowercase();
+            let distance = edit_distance(&normalized, &raw);
+            let prefix_match = raw.starts_with(&normalized) || normalized.starts_with(&raw);
+            let near_match = distance <= 2;
+            (prefix_match || near_match).then_some((distance, candidate))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort();
+    ranked.dedup_by(|left, right| left.1 == right.1);
+    ranked
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .take(3)
         .collect()
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    if left == right {
+        return 0;
+    }
+    if left.is_empty() {
+        return right.chars().count();
+    }
+    if right.is_empty() {
+        return left.chars().count();
+    }
+
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right_chars.len() + 1];
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let substitution_cost = usize::from(left_char != *right_char);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + substitution_cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right_chars.len()]
 }
 
 fn format_tool_call_start(name: &str, input: &str) -> String {
@@ -3262,7 +3524,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
         "bash" | "Bash" => format_bash_call(&parsed),
         "read_file" | "Read" => {
             let path = extract_tool_path(&parsed);
-            format!("\x1b[2m📄 Reading {path}…\x1b[0m")
+            format!("\x1b[2mðŸ“„ Reading {path}â€¦\x1b[0m")
         }
         "write_file" | "Write" => {
             let path = extract_tool_path(&parsed);
@@ -3270,7 +3532,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .get("content")
                 .and_then(|value| value.as_str())
                 .map_or(0, |content| content.lines().count());
-            format!("\x1b[1;32m✏️ Writing {path}\x1b[0m \x1b[2m({lines} lines)\x1b[0m")
+            format!("\x1b[1;32mâœï¸ Writing {path}\x1b[0m \x1b[2m({lines} lines)\x1b[0m")
         }
         "edit_file" | "Edit" => {
             let path = extract_tool_path(&parsed);
@@ -3285,14 +3547,14 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             format!(
-                "\x1b[1;33m📝 Editing {path}\x1b[0m{}",
+                "\x1b[1;33mðŸ“ Editing {path}\x1b[0m{}",
                 format_patch_preview(old_value, new_value)
                     .map(|preview| format!("\n{preview}"))
                     .unwrap_or_default()
             )
         }
-        "glob_search" | "Glob" => format_search_start("🔎 Glob", &parsed),
-        "grep_search" | "Grep" => format_search_start("🔎 Grep", &parsed),
+        "glob_search" | "Glob" => format_search_start("ðŸ”Ž Glob", &parsed),
+        "grep_search" | "Grep" => format_search_start("ðŸ”Ž Grep", &parsed),
         "web_search" | "WebSearch" => parsed
             .get("query")
             .and_then(|value| value.as_str())
@@ -3301,17 +3563,17 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
         _ => summarize_tool_payload(input),
     };
 
-    let border = "─".repeat(name.len() + 8);
+    let border = "â”€".repeat(name.len() + 8);
     format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
+        "\x1b[38;5;245mâ•­â”€ \x1b[1;36m{name}\x1b[0;38;5;245m â”€â•®\x1b[0m\n\x1b[38;5;245mâ”‚\x1b[0m {detail}\n\x1b[38;5;245mâ•°{border}â•¯\x1b[0m"
     )
 }
 
 fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
     let icon = if is_error {
-        "\x1b[1;31m✗\x1b[0m"
+        "\x1b[1;31mâœ—\x1b[0m"
     } else {
-        "\x1b[1;32m✓\x1b[0m"
+        "\x1b[1;32mâœ“\x1b[0m"
     };
     if is_error {
         let summary = truncate_for_summary(output.trim(), 160);
@@ -3336,7 +3598,7 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
 }
 
 const DISPLAY_TRUNCATION_NOTICE: &str =
-    "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
+    "\x1b[2mâ€¦ output truncated for display; full result preserved in session.\x1b[0m";
 const READ_DISPLAY_MAX_LINES: usize = 80;
 const READ_DISPLAY_MAX_CHARS: usize = 6_000;
 const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
@@ -3458,7 +3720,7 @@ fn format_read_result(icon: &str, parsed: &serde_json::Value) -> String {
     let end_line = start_line.saturating_add(num_lines.saturating_sub(1));
 
     format!(
-        "{icon} \x1b[2m📄 Read {path} (lines {}-{} of {})\x1b[0m\n{}",
+        "{icon} \x1b[2mðŸ“„ Read {path} (lines {}-{} of {})\x1b[0m\n{}",
         start_line,
         end_line.max(start_line),
         total_lines,
@@ -3477,7 +3739,7 @@ fn format_write_result(icon: &str, parsed: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .map_or(0, |content| content.lines().count());
     format!(
-        "{icon} \x1b[1;32m✏️ {} {path}\x1b[0m \x1b[2m({line_count} lines)\x1b[0m",
+        "{icon} \x1b[1;32mâœï¸ {} {path}\x1b[0m \x1b[2m({line_count} lines)\x1b[0m",
         if kind == "create" { "Wrote" } else { "Updated" },
     )
 }
@@ -3526,8 +3788,8 @@ fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
     });
 
     match preview {
-        Some(preview) => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m\n{preview}"),
-        None => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m"),
+        Some(preview) => format!("{icon} \x1b[1;33mðŸ“ Edited {path}{suffix}\x1b[0m\n{preview}"),
+        None => format!("{icon} \x1b[1;33mðŸ“ Edited {path}{suffix}\x1b[0m"),
     }
 }
 
@@ -3635,7 +3897,7 @@ fn truncate_for_summary(value: &str, limit: usize) -> String {
     let mut chars = value.chars();
     let truncated = chars.by_ref().take(limit).collect::<String>();
     if chars.next().is_some() {
-        format!("{truncated}…")
+        format!("{truncated}â€¦")
     } else {
         truncated
     }
@@ -3858,9 +4120,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 }
 
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "claw v{VERSION}")?;
+    writeln!(out, "Claw Code CLI v{VERSION}")?;
+    writeln!(
+        out,
+        "  Interactive coding assistant for the current workspace."
+    )?;
     writeln!(out)?;
-    writeln!(out, "Usage:")?;
+    writeln!(out, "Quick start")?;
     writeln!(
         out,
         "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
@@ -3893,7 +4159,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
     writeln!(out)?;
-    writeln!(out, "Flags:")?;
+    writeln!(out, "Flags")?;
     writeln!(
         out,
         "  --model MODEL              Override the active model"
@@ -3916,7 +4182,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  --version, -V              Print version and build information locally"
     )?;
     writeln!(out)?;
-    writeln!(out, "Interactive slash commands:")?;
+    writeln!(out, "Slash command reference")?;
     writeln!(out, "{}", render_slash_command_help())?;
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
@@ -3962,9 +4228,10 @@ mod tests {
         format_status_report, format_tool_call_start, format_tool_result,
         normalize_permission_mode, parse_args, parse_git_status_metadata, permission_policy,
         print_help_to, push_output_block, render_config_report, render_memory_report,
-        render_repl_help, resolve_model_alias, response_to_events, resume_supported_slash_commands,
-        status_context, CliAction, CliOutputFormat, InternalPromptProgressEvent,
-        InternalPromptProgressState, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        render_repl_help, render_unknown_repl_command, resolve_model_alias, response_to_events,
+        resume_supported_slash_commands, status_context, suggest_repl_commands, CliAction,
+        CliOutputFormat, InternalPromptProgressEvent, InternalPromptProgressState, SlashCommand,
+        StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
@@ -4200,7 +4467,7 @@ mod tests {
         );
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
-        assert!(error.contains("unsupported direct slash command"));
+        assert!(error.contains("Direct slash command unavailable"));
     }
 
     #[test]
@@ -4287,11 +4554,11 @@ mod tests {
     #[test]
     fn repl_help_includes_shared_commands_and_exit() {
         let help = render_repl_help();
-        assert!(help.contains("REPL"));
+        assert!(help.contains("Interactive REPL"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
-        assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains("/model <name>"));
+        assert!(help.contains("/permissions <mode>"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
@@ -4309,6 +4576,17 @@ mod tests {
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
+        assert!(help.contains("/quit"));
+        assert!(help.contains("/vim"));
+    }
+
+    #[test]
+    fn repl_command_suggestions_include_close_matches() {
+        let suggestions = suggest_repl_commands("statuz");
+        assert!(suggestions.iter().any(|suggestion| suggestion == "/status"));
+        let rendered = render_unknown_repl_command("statuz");
+        assert!(rendered.contains("Unknown slash command"));
+        assert!(rendered.contains("/status"));
     }
 
     #[test]
@@ -4331,8 +4609,8 @@ mod tests {
         let report = format_resume_report("session.json", 14, 6);
         assert!(report.contains("Session resumed"));
         assert!(report.contains("Session file     session.json"));
-        assert!(report.contains("Messages         14"));
-        assert!(report.contains("Turns            6"));
+        assert!(report.contains("History          14 messages"));
+        assert!(report.contains("Next             /status"));
     }
 
     #[test]
@@ -4341,8 +4619,10 @@ mod tests {
         assert!(compacted.contains("Compact"));
         assert!(compacted.contains("Result           compacted"));
         assert!(compacted.contains("Messages removed 8"));
+        assert!(compacted.contains("Tip              Use /status"));
         let skipped = format_compact_report(0, 3, true);
         assert!(skipped.contains("Result           skipped"));
+        assert!(skipped.contains("Session is already below the compaction threshold"));
     }
 
     #[test]
@@ -4359,6 +4639,8 @@ mod tests {
         assert!(report.contains("Cache create     3"));
         assert!(report.contains("Cache read       1"));
         assert!(report.contains("Total tokens     32"));
+        assert!(report.contains("Next"));
+        assert!(report.contains("/status"));
     }
 
     #[test]
@@ -4367,11 +4649,10 @@ mod tests {
         assert!(report.contains("Permissions"));
         assert!(report.contains("Active mode      workspace-write"));
         assert!(report.contains("Modes"));
-        assert!(report.contains("read-only          ○ available Read/search tools only"));
-        assert!(report.contains("workspace-write    ● current   Edit files inside the workspace"));
-        assert!(report.contains("danger-full-access ○ available Unrestricted tool access"));
+        assert!(report.contains("read-only          available   Read/search tools only"));
+        assert!(report.contains("workspace-write    current     Edit files inside the workspace"));
+        assert!(report.contains("danger-full-access available   Unrestricted tool access"));
     }
-
     #[test]
     fn permissions_switch_report_is_structured() {
         let report = format_permissions_switch_report("read-only", "workspace-write");
@@ -4605,7 +4886,7 @@ mod tests {
             r#"{"file":{"filePath":"src/main.rs","content":"hello","numLines":1,"startLine":1,"totalLines":1}}"#,
             false,
         );
-        assert!(done.contains("📄 Read src/main.rs"));
+        assert!(done.contains("ðŸ“„ Read src/main.rs"));
         assert!(done.contains("hello"));
     }
 

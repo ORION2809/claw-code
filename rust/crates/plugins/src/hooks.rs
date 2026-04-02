@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+#[cfg(not(windows))]
 use std::path::Path;
 use std::process::Command;
 
@@ -309,23 +310,41 @@ mod tests {
         std::env::temp_dir().join(format!("plugins-hook-runner-{label}-{nanos}"))
     }
 
+    fn hook_script_name(stem: &str) -> String {
+        if cfg!(windows) {
+            format!("{stem}.cmd")
+        } else {
+            format!("{stem}.sh")
+        }
+    }
+
+    fn hook_script_body(message: &str) -> String {
+        if cfg!(windows) {
+            format!("@echo off\r\necho {message}\r\n")
+        } else {
+            format!("#!/bin/sh\nprintf '%s\\n' '{message}'\n")
+        }
+    }
+
     fn write_hook_plugin(root: &Path, name: &str, pre_message: &str, post_message: &str) {
         fs::create_dir_all(root.join(".claw-plugin")).expect("manifest dir");
         fs::create_dir_all(root.join("hooks")).expect("hooks dir");
+        let pre_script = hook_script_name("pre");
+        let post_script = hook_script_name("post");
         fs::write(
-            root.join("hooks").join("pre.sh"),
-            format!("#!/bin/sh\nprintf '%s\\n' '{pre_message}'\n"),
+            root.join("hooks").join(&pre_script),
+            hook_script_body(pre_message),
         )
         .expect("write pre hook");
         fs::write(
-            root.join("hooks").join("post.sh"),
-            format!("#!/bin/sh\nprintf '%s\\n' '{post_message}'\n"),
+            root.join("hooks").join(&post_script),
+            hook_script_body(post_message),
         )
         .expect("write post hook");
         fs::write(
             root.join(".claw-plugin").join("plugin.json"),
             format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"]\n  }}\n}}"
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/{pre_script}\"],\n    \"PostToolUse\": [\"./hooks/{post_script}\"]\n  }}\n}}"
             ),
         )
         .expect("write plugin manifest");
@@ -383,7 +402,11 @@ mod tests {
     #[test]
     fn pre_tool_use_denies_when_plugin_hook_exits_two() {
         let runner = HookRunner::new(crate::PluginHooks {
-            pre_tool_use: vec!["printf 'blocked by plugin'; exit 2".to_string()],
+            pre_tool_use: vec![if cfg!(windows) {
+                "echo blocked by plugin&& exit /b 2".to_string()
+            } else {
+                "printf 'blocked by plugin'; exit 2".to_string()
+            }],
             post_tool_use: Vec::new(),
         });
 

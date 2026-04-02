@@ -1280,7 +1280,34 @@ mod tests {
 
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        if let Some(payload) = script
+            .strip_prefix("printf '%s' '")
+            .and_then(|payload| payload.strip_suffix('\''))
+        {
+            return format!("@echo off&& echo {payload}");
+        }
+
+        if let Some((message, exit_code)) = script
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.split_once("'; exit "))
+        {
+            return format!("@echo off&& echo {message}&& exit /b {exit_code}");
+        }
+
+        if let Some(message) = script
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.strip_suffix('\''))
+        {
+            return format!("@echo off&& echo {message}");
+        }
+
+        if let Some(seconds) = script.strip_prefix("sleep ") {
+            return format!(
+                "powershell -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds {seconds}\""
+            );
+        }
+
+        script.to_string()
     }
 
     #[cfg(not(windows))]

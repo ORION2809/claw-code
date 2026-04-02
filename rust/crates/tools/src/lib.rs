@@ -143,7 +143,10 @@ impl GlobalToolRegistry {
         })
     }
 
-    pub fn normalize_allowed_tools(&self, values: &[String]) -> Result<Option<BTreeSet<String>>, String> {
+    pub fn normalize_allowed_tools(
+        &self,
+        values: &[String],
+    ) -> Result<Option<BTreeSet<String>>, String> {
         if values.is_empty() {
             return Ok(None);
         }
@@ -1536,10 +1539,14 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
     }
 
     let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(".agents").join("skills"));
+        candidates.push(cwd.join(".codex").join("skills"));
+    }
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
     }
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         let home = std::path::PathBuf::from(home);
         candidates.push(home.join(".agents").join("skills"));
         candidates.push(home.join(".config").join("opencode").join("skills"));
@@ -1716,30 +1723,65 @@ fn build_agent_runtime(
 }
 
 fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
-    let config = ConfigLoader::new()
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader
         .load()
         .map_err(|error| format!("failed to load configuration: {error}"))?;
-    let plugin_configs = config.feature_config().plugins();
-    if plugin_configs.is_empty() {
+    let plugin_configs = config.plugins();
+    let has_plugin_config = !plugin_configs.enabled_plugins().is_empty()
+        || !plugin_configs.external_directories().is_empty()
+        || plugin_configs.install_root().is_some()
+        || plugin_configs.registry_path().is_some()
+        || plugin_configs.bundled_root().is_some();
+    if !has_plugin_config {
         return Ok(GlobalToolRegistry::builtin());
     }
 
-    let manager = build_plugin_manager(&config)?;
+    let manager = build_plugin_manager(&cwd, &loader, &config);
     let registry = manager
         .plugin_registry()
         .map_err(|error| format!("failed to load plugin registry: {error}"))?;
     let plugin_tools = registry
-        .tool_definitions()
+        .aggregated_tools()
         .map_err(|error| format!("failed to get plugin tools: {error}"))?;
     GlobalToolRegistry::with_plugin_tools(plugin_tools)
 }
 
-fn build_plugin_manager(config: &RuntimeConfig) -> Result<PluginManager, String> {
-    let config_home = config
-        .config_dir()
-        .unwrap_or_else(|| PathBuf::from(".claw"));
-    let manager_config = PluginManagerConfig::new(&config_home);
-    Ok(PluginManager::new(manager_config))
+fn build_plugin_manager(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    config: &RuntimeConfig,
+) -> PluginManager {
+    let plugin_settings = config.plugins();
+    let mut manager_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    manager_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    manager_config.external_dirs = plugin_settings
+        .external_directories()
+        .iter()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
+        .collect();
+    manager_config.install_root = plugin_settings
+        .install_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    manager_config.registry_path = plugin_settings
+        .registry_path()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    manager_config.bundled_root = plugin_settings
+        .bundled_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    PluginManager::new(manager_config)
+}
+
+fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if value.starts_with('.') {
+        cwd.join(path)
+    } else {
+        config_home.join(path)
+    }
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -2949,18 +2991,18 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     let _ = &input.description;
     let shell = detect_powershell_shell()?;
     execute_shell_command(
-        shell,
+        &shell,
         &input.command,
         input.timeout,
         input.run_in_background,
     )
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
+fn detect_powershell_shell() -> std::io::Result<String> {
+    if let Some(path) = resolve_command("pwsh") {
+        Ok(path)
+    } else if let Some(path) = resolve_command("powershell") {
+        Ok(path)
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -2970,12 +3012,39 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    resolve_command(command).is_some()
+}
+
+fn resolve_command(command: &str) -> Option<String> {
+    #[cfg(windows)]
+    let mut output = {
+        let mut probe = std::process::Command::new("where");
+        probe.arg(command);
+        probe.stdout(std::process::Stdio::piped());
+        probe.stderr(std::process::Stdio::null());
+        probe
+    };
+
+    #[cfg(not(windows))]
+    let mut output = {
+        let mut probe = std::process::Command::new("sh");
+        probe.arg("-lc").arg(format!("command -v {command}"));
+        probe.stdout(std::process::Stdio::piped());
+        probe.stderr(std::process::Stdio::null());
+        probe
+    };
+
+    output
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3558,6 +3627,20 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let codex_home = temp_path("codex-home");
+        let skill_dir = codex_home.join("skills").join("help");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Help Skill\n\nGuide on using oh-my-codex plugin.\n",
+        )
+        .expect("write skill");
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        std::env::set_var("CODEX_HOME", &codex_home);
+
         let result = execute_tool(
             "Skill",
             &json!({
@@ -3572,6 +3655,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
@@ -3591,7 +3675,14 @@ mod tests {
         assert!(dollar_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
+
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let _ = fs::remove_dir_all(codex_home);
     }
 
     #[test]
@@ -3866,7 +3957,10 @@ mod tests {
                 calls: 0,
                 input_path: path.display().to_string(),
             },
-            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")]), GlobalToolRegistry::builtin()),
+            SubagentToolExecutor::new(
+                BTreeSet::from([String::from("read_file")]),
+                GlobalToolRegistry::builtin(),
+            ),
             agent_permission_policy(),
             vec![String::from("system prompt")],
         );
@@ -4042,14 +4136,31 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
-        let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
-            .expect("bash should succeed");
+        let success = execute_tool(
+            "bash",
+            &json!({
+                "command": if cfg!(windows) { "echo hello" } else { "printf 'hello'" }
+            }),
+        )
+        .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
-        assert_eq!(success_output["stdout"], "hello");
+        assert_eq!(
+            success_output["stdout"].as_str().expect("stdout").trim(),
+            "hello"
+        );
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
-            .expect("bash failure should still return structured output");
+        let failure = execute_tool(
+            "bash",
+            &json!({
+                "command": if cfg!(windows) {
+                    "echo oops>&2 & exit /b 7"
+                } else {
+                    "printf 'oops' >&2; exit 7"
+                }
+            }),
+        )
+        .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
         assert!(failure_output["stderr"]
@@ -4057,8 +4168,18 @@ mod tests {
             .expect("stderr")
             .contains("oops"));
 
-        let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
-            .expect("bash timeout should return output");
+        let timeout = execute_tool(
+            "bash",
+            &json!({
+                "command": if cfg!(windows) {
+                    "powershell -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 1\""
+                } else {
+                    "sleep 1"
+                },
+                "timeout": 10
+            }),
+        )
+        .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
@@ -4069,7 +4190,14 @@ mod tests {
 
         let background = execute_tool(
             "bash",
-            &json!({ "command": "sleep 1", "run_in_background": true }),
+            &json!({
+                "command": if cfg!(windows) {
+                    "powershell -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 1\""
+                } else {
+                    "sleep 1"
+                },
+                "run_in_background": true
+            }),
         )
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
@@ -4212,6 +4340,7 @@ mod tests {
         assert!(globbed_output["filenames"][0]
             .as_str()
             .expect("filename")
+            .replace('\\', "/")
             .ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
@@ -4405,23 +4534,32 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create dir");
-        let script = dir.join("pwsh");
+        let script = dir.join(if cfg!(windows) { "pwsh.cmd" } else { "pwsh" });
         std::fs::write(
             &script,
-            r#"#!/bin/sh
+            if cfg!(windows) {
+                "@echo off\r\necho pwsh:%4\r\n"
+            } else {
+                r#"#!/bin/sh
 while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
 shift
 printf 'pwsh:%s' "$1"
-"#,
+"#
+            },
         )
         .expect("write script");
+        #[cfg(not(windows))]
         std::process::Command::new("/bin/chmod")
             .arg("+x")
             .arg(&script)
             .status()
             .expect("chmod");
         let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        std::env::set_var(
+            "PATH",
+            format!("{}{}{}", dir.display(), separator, original_path),
+        );
 
         let result = execute_tool(
             "PowerShell",
@@ -4439,7 +4577,12 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(dir);
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
+        let stdout = output["stdout"].as_str().expect("stdout").trim();
+        if cfg!(windows) {
+            assert_eq!(stdout, "pwsh:\"Write-Output hello\"");
+        } else {
+            assert_eq!(stdout, "pwsh:Write-Output hello");
+        }
         assert!(output["stderr"].as_str().expect("stderr").is_empty());
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");

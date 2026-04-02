@@ -2096,18 +2096,32 @@ mod tests {
 
     fn write_lifecycle_plugin(root: &Path, name: &str, version: &str) -> PathBuf {
         let log_path = root.join("lifecycle.log");
+        let init_script = if cfg!(windows) { "init.cmd" } else { "init.sh" };
+        let shutdown_script = if cfg!(windows) {
+            "shutdown.cmd"
+        } else {
+            "shutdown.sh"
+        };
         write_file(
-            root.join("lifecycle").join("init.sh").as_path(),
-            "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+            root.join("lifecycle").join(init_script).as_path(),
+            if cfg!(windows) {
+                "@echo off\r\necho init>> lifecycle.log\r\n"
+            } else {
+                "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n"
+            },
         );
         write_file(
-            root.join("lifecycle").join("shutdown.sh").as_path(),
-            "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+            root.join("lifecycle").join(shutdown_script).as_path(),
+            if cfg!(windows) {
+                "@echo off\r\necho shutdown>> lifecycle.log\r\n"
+            } else {
+                "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n"
+            },
         );
         write_file(
             root.join(MANIFEST_RELATIVE_PATH).as_path(),
             format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"lifecycle plugin\",\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }}\n}}"
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"lifecycle plugin\",\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/{init_script}\"],\n    \"Shutdown\": [\"./lifecycle/{shutdown_script}\"]\n  }}\n}}"
             )
             .as_str(),
         );
@@ -2119,10 +2133,19 @@ mod tests {
     }
 
     fn write_tool_plugin_with_name(root: &Path, name: &str, version: &str, tool_name: &str) {
-        let script_path = root.join("tools").join("echo-json.sh");
+        let script_name = if cfg!(windows) {
+            "echo-json.cmd"
+        } else {
+            "echo-json.sh"
+        };
+        let script_path = root.join("tools").join(script_name);
         write_file(
             &script_path,
-            "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAW_PLUGIN_ID\" \"$CLAW_TOOL_NAME\" \"$INPUT\"\n",
+            if cfg!(windows) {
+                "@echo off\r\npowershell -NoProfile -NonInteractive -Command \"$inputData = [Console]::In.ReadToEnd(); $payload = @{ plugin = $env:CLAW_PLUGIN_ID; tool = $env:CLAW_TOOL_NAME; input = ($inputData | ConvertFrom-Json) }; $payload | ConvertTo-Json -Compress\"\r\n"
+            } else {
+                "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAW_PLUGIN_ID\" \"$CLAW_TOOL_NAME\" \"$INPUT\"\n"
+            },
         );
         #[cfg(unix)]
         {
@@ -2135,7 +2158,7 @@ mod tests {
         write_file(
             root.join(MANIFEST_RELATIVE_PATH).as_path(),
             format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"tool plugin\",\n  \"tools\": [\n    {{\n      \"name\": \"{tool_name}\",\n      \"description\": \"Echo JSON input\",\n      \"inputSchema\": {{\"type\": \"object\", \"properties\": {{\"message\": {{\"type\": \"string\"}}}}, \"required\": [\"message\"], \"additionalProperties\": false}},\n      \"command\": \"./tools/echo-json.sh\",\n      \"requiredPermission\": \"workspace-write\"\n    }}\n  ]\n}}"
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"tool plugin\",\n  \"tools\": [\n    {{\n      \"name\": \"{tool_name}\",\n      \"description\": \"Echo JSON input\",\n      \"inputSchema\": {{\"type\": \"object\", \"properties\": {{\"message\": {{\"type\": \"string\"}}}}, \"required\": [\"message\"], \"additionalProperties\": false}},\n      \"command\": \"./tools/{script_name}\",\n      \"requiredPermission\": \"workspace-write\"\n    }}\n  ]\n}}"
             )
             .as_str(),
         );
@@ -2845,7 +2868,7 @@ mod tests {
         registry.shutdown().expect("shutdown should succeed");
 
         let log = fs::read_to_string(&log_path).expect("lifecycle log should exist");
-        assert_eq!(log, "init\nshutdown\n");
+        assert_eq!(log.replace("\r\n", "\n"), "init\nshutdown\n");
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);

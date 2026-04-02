@@ -652,7 +652,7 @@ mod tests {
 
     use super::{
         now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
-        resolve_startup_auth_source, ClawApiClient, AuthSource, OAuthTokenSet,
+        resolve_startup_auth_source, AuthSource, ClawApiClient, OAuthTokenSet,
     };
     use crate::types::{ContentBlockDelta, MessageRequest};
 
@@ -715,27 +715,36 @@ mod tests {
     #[test]
     fn read_api_key_requires_presence() {
         let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::fs::create_dir_all(&config_home).expect("temp config home");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         let error = super::read_api_key().expect_err("missing key should error");
         assert!(matches!(
             error,
             crate::error::ApiError::MissingCredentials { .. }
         ));
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[test]
     fn read_api_key_requires_non_empty_value() {
         let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::fs::create_dir_all(&config_home).expect("temp config home");
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         let error = super::read_api_key().expect_err("empty key should error");
         assert!(matches!(
             error,
             crate::error::ApiError::MissingCredentials { .. }
         ));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[test]

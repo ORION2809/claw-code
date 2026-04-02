@@ -121,9 +121,21 @@ impl PermissionPolicy {
 
     #[must_use]
     pub fn with_permission_rules(mut self, rules: &RuntimePermissionRuleConfig) -> Self {
-        self.allow_rules = rules.allow().iter().map(|r| PermissionRule::parse(r)).collect();
-        self.deny_rules = rules.deny().iter().map(|r| PermissionRule::parse(r)).collect();
-        self.ask_rules = rules.ask().iter().map(|r| PermissionRule::parse(r)).collect();
+        self.allow_rules = rules
+            .allow()
+            .iter()
+            .map(|r| PermissionRule::parse(r))
+            .collect();
+        self.deny_rules = rules
+            .deny()
+            .iter()
+            .map(|r| PermissionRule::parse(r))
+            .collect();
+        self.ask_rules = rules
+            .ask()
+            .iter()
+            .map(|r| PermissionRule::parse(r))
+            .collect();
         self
     }
 
@@ -564,11 +576,8 @@ mod tests {
 
     #[test]
     fn allow_rule_grants_access() {
-        let rules = RuntimePermissionRuleConfig::new(
-            vec!["bash".to_string()],
-            Vec::new(),
-            Vec::new(),
-        );
+        let rules =
+            RuntimePermissionRuleConfig::new(vec!["bash".to_string()], Vec::new(), Vec::new());
         let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
             .with_permission_rules(&rules);
@@ -581,21 +590,20 @@ mod tests {
 
     #[test]
     fn authorize_with_context_uses_override() {
-        let rules = RuntimePermissionRuleConfig::new(
-            Vec::new(),
-            vec!["bash".to_string()],
-            Vec::new(),
-        );
+        let rules =
+            RuntimePermissionRuleConfig::new(Vec::new(), vec!["bash".to_string()], Vec::new());
         let policy = PermissionPolicy::new(PermissionMode::Allow)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
             .with_permission_rules(&rules);
 
         // deny_rules always win regardless of context
-        let outcome = policy.authorize_with_context("bash", "{}", &PermissionContext::default(), None);
+        let outcome =
+            policy.authorize_with_context("bash", "{}", &PermissionContext::default(), None);
         assert!(matches!(outcome, PermissionOutcome::Deny { .. }));
 
         // context override Deny is honoured for non-deny-rule tools
-        let ctx = PermissionContext::new(Some(PermissionOverride::Deny), Some("hook denied".into()));
+        let ctx =
+            PermissionContext::new(Some(PermissionOverride::Deny), Some("hook denied".into()));
         let policy2 = PermissionPolicy::new(PermissionMode::Allow);
         let outcome2 = policy2.authorize_with_context("read", "{}", &ctx, None);
         assert!(matches!(outcome2, PermissionOutcome::Deny { .. }));

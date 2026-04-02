@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::io::Write;
+#[cfg(not(windows))]
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -699,8 +700,10 @@ enum CommandExecution {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
         HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult,
@@ -717,6 +720,25 @@ mod tests {
         fn on_event(&mut self, event: &HookProgressEvent) {
             self.events.push(event.clone());
         }
+    }
+
+    #[cfg(windows)]
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("runtime-hooks-{label}-{nanos}"))
+    }
+
+    #[cfg(windows)]
+    fn json_hook_command(payload: &str) -> String {
+        let root = temp_dir("json-output");
+        fs::create_dir_all(&root).expect("hook temp dir");
+        let script_path = root.join("json-output.cmd");
+        fs::write(&script_path, format!("@echo off\r\necho {payload}\r\n"))
+            .expect("json hook script");
+        script_path.to_string_lossy().into_owned()
     }
 
     #[test]
@@ -767,10 +789,18 @@ mod tests {
 
     #[test]
     fn parses_pre_hook_permission_override_and_updated_input() {
+        #[cfg(windows)]
+        let pre_hook = json_hook_command(
+            r#"{"systemMessage":"updated","hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"hook ok","updatedInput":{"command":"git status"}}}"#,
+        );
+
+        #[cfg(not(windows))]
+        let pre_hook = shell_snippet(
+            r#"printf '%s' '{"systemMessage":"updated","hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"hook ok","updatedInput":{"command":"git status"}}}'"#,
+        );
+
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet(
-                r#"printf '%s' '{"systemMessage":"updated","hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"hook ok","updatedInput":{"command":"git status"}}}'"#,
-            )],
+            vec![pre_hook],
             Vec::new(),
             Vec::new(),
         ));
@@ -843,7 +873,34 @@ mod tests {
 
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        if let Some(payload) = script
+            .strip_prefix("printf '%s' '")
+            .and_then(|payload| payload.strip_suffix('\''))
+        {
+            return format!("@echo off&& echo {payload}");
+        }
+
+        if let Some((message, exit_code)) = script
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.split_once("'; exit "))
+        {
+            return format!("@echo off&& echo {message}&& exit /b {exit_code}");
+        }
+
+        if let Some(message) = script
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.strip_suffix('\''))
+        {
+            return format!("@echo off&& echo {message}");
+        }
+
+        if let Some(seconds) = script.strip_prefix("sleep ") {
+            return format!(
+                "powershell -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds {seconds}\""
+            );
+        }
+
+        script.to_string()
     }
 
     #[cfg(not(windows))]

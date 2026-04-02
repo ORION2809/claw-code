@@ -1,191 +1,142 @@
-# Rewriting Project Claw Code
+# 🦞 Claw Code
 
 <p align="center">
-  <strong>⭐ The fastest repo in history to surpass 50K stars, reaching the milestone in just 2 hours after publication ⭐</strong>
+  <img src="assets/clawd-hero.jpeg" alt="Claw Code" width="300" />
 </p>
 
 <p align="center">
-  <a href="https://star-history.com/#instructkr/claw-code&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=instructkr/claw-code&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=instructkr/claw-code&type=Date" />
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=instructkr/claw-code&type=Date" width="600" />
-    </picture>
-  </a>
+  <strong>A high-performance, multi-provider CLI agent harness — built in Rust</strong>
 </p>
 
 <p align="center">
-  <img src="assets/clawd-hero.jpeg" alt="Claw" width="300" />
-</p>
-
-<p align="center">
-  <strong>Better Harness Tools, not merely storing the archive of leaked Claude Code</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/sponsors/instructkr"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github&style=for-the-badge" alt="Sponsor on GitHub" /></a>
+  <a href="https://github.com/ORION2809/claw-code"><img src="https://img.shields.io/badge/GitHub-ORION2809%2Fclaw--code-181717?logo=github&style=for-the-badge" alt="GitHub" /></a>
 </p>
 
 > [!IMPORTANT]
-> **Rust port is now in progress** on the [`dev/rust`](https://github.com/instructkr/claw-code/tree/dev/rust) branch and is expected to be merged into main today. The Rust implementation aims to deliver a faster, memory-safe harness runtime. Stay tuned — this will be the definitive version of the project.
-
-> If you find this work useful, consider [sponsoring @instructkr on GitHub](https://github.com/sponsors/instructkr) to support continued open-source harness engineering research.
+> **This fork has been upgraded with a superior merge** that combines the latest upstream Rust improvements with multi-provider API support, enhanced plugin infrastructure, and advanced permission/hook systems. See the [Upgrade Details](#upgrade-details) section below.
 
 ---
 
-## Backstory
+## Upgrade Details
 
-At 4 AM on March 31, 2026, I woke up to my phone blowing up with notifications. The Claude Code source had been exposed, and the entire dev community was in a frenzy. My girlfriend in Korea was genuinely worried I might face legal action from Anthropic just for having the code on my machine — so I did what any engineer would do under pressure: I sat down, ported the core features to Python from scratch, and pushed it before the sun came up.
+This repository has been upgraded from the original [instructkr/claw-code](https://github.com/instructkr/claw-code) with a comprehensive **superior merge** that ports all improvements from the `dev/rust` branch while preserving and extending the unique multi-provider capabilities of the `main` branch.
 
-The whole thing was orchestrated end-to-end using [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex) by [@bellman_ych](https://x.com/bellman_ych) — a workflow layer built on top of OpenAI's Codex ([@OpenAIDevs](https://x.com/OpenAIDevs)). I used `$team` mode for parallel code review and `$ralph` mode for persistent execution loops with architect-level verification. The entire porting session — from reading the original harness structure to producing a working Python tree with tests — was driven through OmX orchestration.
+### What was upgraded
 
-The result is a clean-room Python rewrite that captures the architectural patterns of Claude Code's agent harness without copying any proprietary source. I'm now actively collaborating with [@bellman_ych](https://x.com/bellman_ych) — the creator of OmX himself — to push this further. The basic Python foundation is already in place and functional, but we're just getting started. **Stay tuned — a much more capable version is on the way.**
+| Area | Changes |
+|------|---------|
+| **Hook System** | Complete rewrite (~280 → ~860 lines). Added `HookAbortSignal`, `HookProgressReporter`, `PostToolUseFailure` hooks, JSON-parsed hook output, abort signal polling, progress event reporting |
+| **Permission System** | Added `PermissionOverride`, `PermissionContext`, `PermissionRule` with rule-based matching. Rewrote `authorize_with_context` for context-aware authorization |
+| **Auto-Compaction** | Automatic conversation compaction at 200K token threshold with `AutoCompactionEvent` reporting |
+| **Plugin Lifecycle** | Full `PluginRegistry` integration, `new_with_plugins()` constructor, `shutdown_registered_plugins()`, `Drop`-based cleanup |
+| **Tool System** | `RegisteredTool` abstraction with `RegisteredToolHandler` (Builtin/Plugin), unified `GlobalToolRegistry`, `normalize_registry_tool_name` |
+| **CLI Integration** | `HookAbortMonitor` (Ctrl+C → abort signal), `CliHookProgressReporter`, `prepare_turn_runtime()` pattern, auto-compaction notices |
+| **Configuration** | `RuntimePermissionRuleConfig`, permission rules in config loader, `post_tool_use_failure` hook config |
 
-https://github.com/instructkr/claw-code
+### What was preserved (multi-provider superiority)
 
-![Tweet screenshot](assets/tweet-screenshot.png)
+- **Multi-provider API** — `ProviderClient` enum supporting Claude, Grok, and OpenAI-compatible endpoints
+- **OAuth authentication** — Full OAuth login/logout flow
+- **Claw Code branding** — `claw` binary, `CLAW_` environment variables, `.claw` config paths
+- **Commands crate** — Multi-provider model discovery, legacy command support, help text generation
+- **Model aliases** — `opus`, `sonnet`, `haiku` resolving to latest versions across providers
 
-## The Creators Featured in Wall Street Journal For Avid Claude Code Fans
+### Files modified
 
-I've been deeply interested in **harness engineering** — studying how agent systems wire tools, orchestrate tasks, and manage runtime context. This isn't a sudden thing. The Wall Street Journal featured my work earlier this month, documenting how I've been one of the most active power users exploring these systems:
-
-> AI startup worker Sigrid Jin, who attended the Seoul dinner, single-handedly used 25 billion of Claude Code tokens last year. At the time, usage limits were looser, allowing early enthusiasts to reach tens of billions of tokens at a very low cost.
->
-> Despite his countless hours with Claude Code, Jin isn't faithful to any one AI lab. The tools available have different strengths and weaknesses, he said. Codex is better at reasoning, while Claude Code generates cleaner, more shareable code.
->
-> Jin flew to San Francisco in February for Claude Code's first birthday party, where attendees waited in line to compare notes with Cherny. The crowd included a practicing cardiologist from Belgium who had built an app to help patients navigate care, and a California lawyer who made a tool for automating building permit approvals using Claude Code.
->
-> "It was basically like a sharing party," Jin said. "There were lawyers, there were doctors, there were dentists. They did not have software engineering backgrounds."
->
-> — *The Wall Street Journal*, March 21, 2026, [*"The Trillion Dollar Race to Automate Our Entire Lives"*](https://lnkd.in/gs9td3qd)
-
-![WSJ Feature](assets/wsj-feature.png)
+- `rust/crates/runtime/src/config.rs` — Permission rule config, hook config extensions
+- `rust/crates/runtime/src/permissions.rs` — Context-aware authorization, permission rules
+- `rust/crates/runtime/src/hooks.rs` — Complete hook pipeline rewrite
+- `rust/crates/runtime/src/lib.rs` — Updated public API exports
+- `rust/crates/runtime/src/conversation.rs` — Auto-compaction, plugin lifecycle, hook integration
+- `rust/crates/tools/src/lib.rs` — RegisteredTool, unified tool registry
+- `rust/crates/claw-cli/src/main.rs` — Abort monitor, progress reporter, runtime construction
 
 ---
 
-## Porting Status
+## Quick Start
 
-The main source tree is now Python-first.
+```bash
+# Build
+cd rust/
+cargo build --release
 
-- `src/` contains the active Python porting workspace
-- `tests/` verifies the current Python workspace
-- the exposed snapshot is no longer part of the tracked repository state
+# Run interactive REPL
+./target/release/claw
 
-The current Python workspace is not yet a complete one-to-one replacement for the original system, but the primary implementation surface is now Python.
+# One-shot prompt
+./target/release/claw prompt "explain this codebase"
 
-## Why this rewrite exists
+# With specific model
+./target/release/claw --model sonnet prompt "fix the bug in main.rs"
+```
 
-I originally studied the exposed codebase to understand its harness, tool wiring, and agent workflow. After spending more time with the legal and ethical questions—and after reading the essay linked below—I did not want the exposed snapshot itself to remain the main tracked source tree.
+## Configuration
 
-This repository now focuses on Python porting work instead.
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+# Or use a proxy / OpenAI-compatible endpoint
+export ANTHROPIC_BASE_URL="https://your-proxy.com"
+```
+
+Or authenticate via OAuth:
+
+```bash
+claw login
+```
 
 ## Repository Layout
 
 ```text
 .
-├── src/                                # Python porting workspace
-│   ├── __init__.py
-│   ├── commands.py
-│   ├── main.py
-│   ├── models.py
-│   ├── port_manifest.py
-│   ├── query_engine.py
-│   ├── task.py
-│   └── tools.py
+├── rust/                               # Rust workspace (primary implementation)
+│   ├── crates/
+│   │   ├── api/                        # Multi-provider API client + SSE streaming
+│   │   ├── claw-cli/                   # Main CLI binary (claw)
+│   │   ├── commands/                   # Slash command registry
+│   │   ├── compat-harness/             # TS manifest extraction
+│   │   ├── plugins/                    # Plugin system
+│   │   ├── runtime/                    # Conversation runtime, config, permissions, hooks
+│   │   └── tools/                      # Built-in tool implementations
+│   └── Cargo.toml
+├── src/                                # Python porting workspace (reference)
 ├── tests/                              # Python verification
-├── assets/omx/                         # OmX workflow screenshots
-├── 2026-03-09-is-legal-the-same-as-legitimate-ai-reimplementation-and-the-erosion-of-copyleft.md
 └── README.md
 ```
 
-## Python Workspace Overview
+## Features
 
-The new Python `src/` tree currently provides:
+| Feature | Status |
+|---------|--------|
+| Multi-provider API (Claude, Grok, OpenAI) | ✅ |
+| API + SSE streaming | ✅ |
+| OAuth login/logout | ✅ |
+| Interactive REPL (rustyline) | ✅ |
+| Tool system (bash, read, write, edit, grep, glob) | ✅ |
+| Web tools (search, fetch) | ✅ |
+| Sub-agent orchestration | ✅ |
+| Hook system (Pre/Post ToolUse + abort signals) | ✅ |
+| Hook progress reporting | ✅ |
+| Permission rules (context-aware authorization) | ✅ |
+| Plugin system with registry | ✅ |
+| Auto-compaction (200K token threshold) | ✅ |
+| RegisteredTool abstraction (Builtin + Plugin) | ✅ |
+| CLAW.md / project memory | ✅ |
+| Config file hierarchy (.claw.json) | ✅ |
+| Session persistence + resume | ✅ |
+| Extended thinking (thinking blocks) | ✅ |
+| Cost tracking + usage display | ✅ |
+| Git integration | ✅ |
+| Markdown terminal rendering (ANSI) | ✅ |
+| Model aliases (opus/sonnet/haiku) | ✅ |
+| Slash commands (/status, /compact, /clear, etc.) | ✅ |
+| Skills registry | ✅ |
 
-- **`port_manifest.py`** — summarizes the current Python workspace structure
-- **`models.py`** — dataclasses for subsystems, modules, and backlog state
-- **`commands.py`** — Python-side command port metadata
-- **`tools.py`** — Python-side tool port metadata
-- **`query_engine.py`** — renders a Python porting summary from the active workspace
-- **`main.py`** — a CLI entrypoint for manifest and summary output
+## Acknowledgements
 
-## Quickstart
-
-Render the Python porting summary:
-
-```bash
-python3 -m src.main summary
-```
-
-Print the current Python workspace manifest:
-
-```bash
-python3 -m src.main manifest
-```
-
-List the current Python modules:
-
-```bash
-python3 -m src.main subsystems --limit 16
-```
-
-Run verification:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-Run the parity audit against the local ignored archive (when present):
-
-```bash
-python3 -m src.main parity-audit
-```
-
-Inspect mirrored command/tool inventories:
-
-```bash
-python3 -m src.main commands --limit 10
-python3 -m src.main tools --limit 10
-```
-
-## Current Parity Checkpoint
-
-The port now mirrors the archived root-entry file surface, top-level subsystem names, and command/tool inventories much more closely than before. However, it is **not yet** a full runtime-equivalent replacement for the original TypeScript system; the Python tree still contains fewer executable runtime slices than the archived source.
-
-
-## Built with `oh-my-codex`
-
-The restructuring and documentation work on this repository was AI-assisted and orchestrated with Yeachan Heo's [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex), layered on top of Codex.
-
-- **`$team` mode:** used for coordinated parallel review and architectural feedback
-- **`$ralph` mode:** used for persistent execution, verification, and completion discipline
-- **Codex-driven workflow:** used to turn the main `src/` tree into a Python-first porting workspace
-
-### OmX workflow screenshots
-
-![OmX workflow screenshot 1](assets/omx/omx-readme-review-1.png)
-
-*Ralph/team orchestration view while the README and essay context were being reviewed in terminal panes.*
-
-![OmX workflow screenshot 2](assets/omx/omx-readme-review-2.png)
-
-*Split-pane review and verification flow during the final README wording pass.*
-
-## Community
-
-<p align="center">
-  <a href="https://instruct.kr/"><img src="assets/instructkr.png" alt="instructkr" width="400" /></a>
-</p>
-
-Join the [**instructkr Discord**](https://instruct.kr/) — the best Korean language model community. Come chat about LLMs, harness engineering, agent workflows, and everything in between.
-
-[![Discord](https://img.shields.io/badge/Join%20Discord-instruct.kr-5865F2?logo=discord&style=for-the-badge)](https://instruct.kr/)
-
-## Star History
-
-See the chart at the top of this README.
+This project is forked from [instructkr/claw-code](https://github.com/instructkr/claw-code), originally created by Sigrid Jin ([@instructkr](https://github.com/instructkr)). The original Python rewrite and Rust port were orchestrated using [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex).
 
 ## Ownership / Affiliation Disclaimer
 
+- This repository is maintained by [ORION2809](https://github.com/ORION2809).
 - This repository does **not** claim ownership of the original Claude Code source material.
 - This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.

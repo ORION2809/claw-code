@@ -10,9 +10,9 @@ use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
@@ -27,7 +27,7 @@ use commands::{
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
-use plugins::{PluginManager, PluginManagerConfig};
+use plugins::{PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
@@ -759,6 +759,10 @@ fn format_cost_report(usage: TokenUsage) -> String {
     )
 }
 
+fn format_auto_compaction_notice(removed: usize) -> String {
+    format!("[auto-compacted: removed {removed} messages]")
+}
+
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Session resumed
@@ -1017,6 +1021,61 @@ struct LiveCli {
     session: SessionHandle,
 }
 
+struct HookAbortMonitor {
+    stop_tx: Option<Sender<()>>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl HookAbortMonitor {
+    fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
+        Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+
+            rt.block_on(async move {
+                let wait_for_stop = tokio::task::spawn_blocking(move || {
+                    let _ = stop_rx.recv();
+                });
+
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if result.is_ok() {
+                            abort_signal.abort();
+                        }
+                    }
+                    _ = wait_for_stop => {}
+                }
+            });
+        })
+    }
+
+    fn spawn_with_waiter<F>(abort_signal: runtime::HookAbortSignal, wait_for_interrupt: F) -> Self
+    where
+        F: FnOnce(Receiver<()>, runtime::HookAbortSignal) + Send + 'static,
+    {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let join_handle = thread::spawn(move || wait_for_interrupt(stop_rx, abort_signal));
+
+        Self {
+            stop_tx: Some(stop_tx),
+            join_handle: Some(join_handle),
+        }
+    }
+
+    fn stop(mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+}
+
 impl LiveCli {
     fn new(
         model: String,
@@ -1073,7 +1132,35 @@ impl LiveCli {
         )
     }
 
+    fn prepare_turn_runtime(
+        &self,
+        emit_output: bool,
+    ) -> Result<
+        (
+            ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>,
+            HookAbortMonitor,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let hook_abort_signal = runtime::HookAbortSignal::new();
+        let runtime = build_runtime(
+            self.runtime.session().clone(),
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            emit_output,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?
+        .with_hook_abort_signal(hook_abort_signal.clone());
+        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
+
+        Ok((runtime, hook_abort_monitor))
+    }
+
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -1082,15 +1169,23 @@ impl LiveCli {
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        self.runtime = runtime;
         match result {
-            Ok(_) => {
+            Ok(summary) => {
                 spinner.finish(
                     "✨ Done",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
                 println!();
+                if let Some(event) = summary.auto_compaction {
+                    println!(
+                        "{}",
+                        format_auto_compaction_notice(event.removed_message_count)
+                    );
+                }
                 self.persist_session()?;
                 Ok(())
             }
@@ -1117,19 +1212,11 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let session = self.runtime.session().clone();
-        let mut runtime = build_runtime(
-            session,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            false,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-        )?;
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let summary = runtime.run_turn(input, Some(&mut permission_prompter))?;
+        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        let summary = result?;
         self.runtime = runtime;
         self.persist_session()?;
         println!(
@@ -1138,6 +1225,10 @@ impl LiveCli {
                 "message": final_assistant_text(&summary),
                 "model": self.model,
                 "iterations": summary.iterations,
+                "auto_compaction": summary.auto_compaction.map(|event| json!({
+                    "removed_messages": event.removed_message_count,
+                    "notice": format_auto_compaction_notice(event.removed_message_count),
+                })),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
                 "usage": {
@@ -2406,13 +2497,26 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
 }
 
 fn build_runtime_plugin_state(
-) -> Result<(runtime::RuntimeFeatureConfig, GlobalToolRegistry), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        runtime::RuntimeFeatureConfig,
+        PluginRegistry,
+        GlobalToolRegistry,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load()?;
     let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_manager.aggregated_tools()?)?;
-    Ok((runtime_config.feature_config().clone(), tool_registry))
+    let plugin_registry = plugin_manager.plugin_registry()?;
+    let tool_registry =
+        GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?;
+    Ok((
+        runtime_config.feature_config().clone(),
+        plugin_registry,
+        tool_registry,
+    ))
 }
 
 fn build_plugin_manager(
@@ -2791,8 +2895,8 @@ fn build_runtime(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>> {
-    let (feature_config, tool_registry) = build_runtime_plugin_state()?;
-    Ok(ConversationRuntime::new_with_features(
+    let (feature_config, plugin_registry, tool_registry) = build_runtime_plugin_state()?;
+    let mut runtime = ConversationRuntime::new_with_plugins(
         session,
         DefaultRuntimeClient::new(
             model,
@@ -2803,10 +2907,48 @@ fn build_runtime(
             progress_reporter,
         )?,
         CliToolExecutor::new(allowed_tools.clone(), emit_output, tool_registry.clone()),
-        permission_policy(permission_mode, &tool_registry),
+        permission_policy(permission_mode, &feature_config, &tool_registry),
         system_prompt,
         feature_config,
-    ))
+        plugin_registry,
+    )?;
+    if emit_output {
+        runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
+    }
+    Ok(runtime)
+}
+
+struct CliHookProgressReporter;
+
+impl runtime::HookProgressReporter for CliHookProgressReporter {
+    fn on_event(&mut self, event: &runtime::HookProgressEvent) {
+        match event {
+            runtime::HookProgressEvent::Started {
+                event,
+                tool_name,
+                command,
+            } => eprintln!(
+                "[hook {event_name}] {tool_name}: {command}",
+                event_name = event.as_str()
+            ),
+            runtime::HookProgressEvent::Completed {
+                event,
+                tool_name,
+                command,
+            } => eprintln!(
+                "[hook done {event_name}] {tool_name}: {command}",
+                event_name = event.as_str()
+            ),
+            runtime::HookProgressEvent::Cancelled {
+                event,
+                tool_name,
+                command,
+            } => eprintln!(
+                "[hook cancelled {event_name}] {tool_name}: {command}",
+                event_name = event.as_str()
+            ),
+        }
+    }
 }
 
 struct CliPermissionPrompter {
@@ -3661,9 +3803,13 @@ impl ToolExecutor for CliToolExecutor {
     }
 }
 
-fn permission_policy(mode: PermissionMode, tool_registry: &GlobalToolRegistry) -> PermissionPolicy {
+fn permission_policy(
+    mode: PermissionMode,
+    feature_config: &runtime::RuntimeFeatureConfig,
+    tool_registry: &GlobalToolRegistry,
+) -> PermissionPolicy {
     tool_registry.permission_specs(None).into_iter().fold(
-        PermissionPolicy::new(mode),
+        PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules()),
         |policy, (name, required_permission)| {
             policy.with_tool_requirement(name, required_permission)
         },
@@ -4122,7 +4268,11 @@ mod tests {
 
     #[test]
     fn permission_policy_uses_plugin_tool_permissions() {
-        let policy = permission_policy(PermissionMode::ReadOnly, &registry_with_plugin_tool());
+        let policy = permission_policy(
+            PermissionMode::ReadOnly,
+            &runtime::RuntimeFeatureConfig::default(),
+            &registry_with_plugin_tool(),
+        );
         let required = policy.required_mode_for("plugin_echo");
         assert_eq!(required, PermissionMode::WorkspaceWrite);
     }

@@ -39,7 +39,8 @@ claw login
 
 | Feature | Status |
 |---------|--------|
-| API + streaming | ✅ |
+| Multi-provider API (Claude, Grok, OpenAI) | ✅ |
+| API + SSE streaming | ✅ |
 | OAuth login/logout | ✅ |
 | Interactive REPL (rustyline) | ✅ |
 | Tool system (bash, read, write, edit, grep, glob) | ✅ |
@@ -49,7 +50,12 @@ claw login
 | Notebook editing | ✅ |
 | CLAW.md / project memory | ✅ |
 | Config file hierarchy (.claw.json) | ✅ |
-| Permission system | ✅ |
+| Permission system (context-aware + rules) | ✅ |
+| Hook system (Pre/Post ToolUse + abort signals) | ✅ |
+| Hook progress reporting | ✅ |
+| Plugin system with PluginRegistry | ✅ |
+| Auto-compaction (200K token threshold) | ✅ |
+| RegisteredTool abstraction (Builtin + Plugin) | ✅ |
 | MCP server lifecycle | ✅ |
 | Session persistence + resume | ✅ |
 | Extended thinking (thinking blocks) | ✅ |
@@ -58,9 +64,7 @@ claw login
 | Markdown terminal rendering (ANSI) | ✅ |
 | Model aliases (opus/sonnet/haiku) | ✅ |
 | Slash commands (/status, /compact, /clear, etc.) | ✅ |
-| Hooks (PreToolUse/PostToolUse) | 🔧 Config only |
-| Plugin system | 📋 Planned |
-| Skills registry | 📋 Planned |
+| Skills registry | ✅ |
 
 ## Model Aliases
 
@@ -139,10 +143,14 @@ rust/
 ## Stats
 
 - **~20K lines** of Rust
-- **6 crates** in workspace
+- **7 crates** in workspace (api, claw-cli, commands, compat-harness, plugins, runtime, tools)
 - **Binary name:** `claw`
 - **Default model:** `claude-opus-4-6`
 - **Default permissions:** `danger-full-access`
+
+## Maintainer
+
+Maintained by [ORION2809](https://github.com/ORION2809). Forked from [instructkr/claw-code](https://github.com/instructkr/claw-code).
 
 ## License
 

@@ -8,13 +8,13 @@ use api::{
     MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
-use plugins::PluginTool;
+use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
-    ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader, ContentBlock,
+    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode,
+    PermissionPolicy, RuntimeConfig, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -57,38 +57,90 @@ pub struct ToolSpec {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RegisteredTool {
+    pub definition: ToolDefinition,
+    pub required_permission: PermissionMode,
+    handler: RegisteredToolHandler,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+enum RegisteredToolHandler {
+    Builtin,
+    Plugin(PluginTool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct GlobalToolRegistry {
-    plugin_tools: Vec<PluginTool>,
+    entries: Vec<RegisteredTool>,
 }
 
 impl GlobalToolRegistry {
     #[must_use]
     pub fn builtin() -> Self {
         Self {
-            plugin_tools: Vec::new(),
+            entries: mvp_tool_specs()
+                .into_iter()
+                .map(|spec| RegisteredTool {
+                    definition: ToolDefinition {
+                        name: spec.name.to_string(),
+                        description: Some(spec.description.to_string()),
+                        input_schema: spec.input_schema,
+                    },
+                    required_permission: spec.required_permission,
+                    handler: RegisteredToolHandler::Builtin,
+                })
+                .collect(),
         }
     }
 
     pub fn with_plugin_tools(plugin_tools: Vec<PluginTool>) -> Result<Self, String> {
-        let builtin_names = mvp_tool_specs()
-            .into_iter()
-            .map(|spec| spec.name.to_string())
-            .collect::<BTreeSet<_>>();
-        let mut seen_plugin_names = BTreeSet::new();
+        let mut registry = Self::builtin();
+        let mut seen = registry
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    normalize_registry_tool_name(&entry.definition.name),
+                    entry.definition.name.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
 
-        for tool in &plugin_tools {
-            let name = tool.definition().name.clone();
-            if builtin_names.contains(&name) {
+        for tool in plugin_tools {
+            let normalized = normalize_registry_tool_name(&tool.definition().name);
+            if let Some(existing) = seen.get(&normalized) {
                 return Err(format!(
-                    "plugin tool `{name}` conflicts with a built-in tool name"
+                    "plugin tool `{}` from `{}` conflicts with already-registered tool `{existing}`",
+                    tool.definition().name,
+                    tool.plugin_id()
                 ));
             }
-            if !seen_plugin_names.insert(name.clone()) {
-                return Err(format!("duplicate plugin tool name `{name}`"));
-            }
+            seen.insert(normalized, tool.definition().name.clone());
+            registry.entries.push(RegisteredTool {
+                definition: ToolDefinition {
+                    name: tool.definition().name.clone(),
+                    description: tool.definition().description.clone(),
+                    input_schema: tool.definition().input_schema.clone(),
+                },
+                required_permission: permission_mode_from_plugin_tool(tool.required_permission())?,
+                handler: RegisteredToolHandler::Plugin(tool),
+            });
         }
 
-        Ok(Self { plugin_tools })
+        Ok(registry)
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[RegisteredTool] {
+        &self.entries
+    }
+
+    fn find_entry(&self, name: &str) -> Option<&RegisteredTool> {
+        let normalized = normalize_registry_tool_name(name);
+        self.entries.iter().find(|entry| {
+            normalize_registry_tool_name(entry.definition.name.as_str()) == normalized
+        })
     }
 
     pub fn normalize_allowed_tools(&self, values: &[String]) -> Result<Option<BTreeSet<String>>, String> {
@@ -96,15 +148,14 @@ impl GlobalToolRegistry {
             return Ok(None);
         }
 
-        let builtin_specs = mvp_tool_specs();
-        let canonical_names = builtin_specs
+        let canonical_names = self
+            .entries
             .iter()
-            .map(|spec| spec.name.to_string())
-            .chain(self.plugin_tools.iter().map(|tool| tool.definition().name.clone()))
+            .map(|entry| entry.definition.name.clone())
             .collect::<Vec<_>>();
         let mut name_map = canonical_names
             .iter()
-            .map(|name| (normalize_tool_name(name), name.clone()))
+            .map(|name| (normalize_registry_tool_name(name), name.clone()))
             .collect::<BTreeMap<_, _>>();
 
         for (alias, canonical) in [
@@ -114,7 +165,9 @@ impl GlobalToolRegistry {
             ("glob", "glob_search"),
             ("grep", "grep_search"),
         ] {
-            name_map.insert(alias.to_string(), canonical.to_string());
+            if canonical_names.iter().any(|name| name == canonical) {
+                name_map.insert(alias.to_string(), canonical.to_string());
+            }
         }
 
         let mut allowed = BTreeSet::new();
@@ -123,7 +176,7 @@ impl GlobalToolRegistry {
                 .split(|ch: char| ch == ',' || ch.is_whitespace())
                 .filter(|token| !token.is_empty())
             {
-                let normalized = normalize_tool_name(token);
+                let normalized = normalize_registry_tool_name(token);
                 let canonical = name_map.get(&normalized).ok_or_else(|| {
                     format!(
                         "unsupported tool in --allowedTools: {token} (expected one of: {})",
@@ -139,26 +192,13 @@ impl GlobalToolRegistry {
 
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
-        let builtin = mvp_tool_specs()
-            .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
-            .map(|spec| ToolDefinition {
-                name: spec.name.to_string(),
-                description: Some(spec.description.to_string()),
-                input_schema: spec.input_schema,
-            });
-        let plugin = self
-            .plugin_tools
+        self.entries
             .iter()
-            .filter(|tool| {
-                allowed_tools.is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+            .filter(|entry| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(entry.definition.name.as_str()))
             })
-            .map(|tool| ToolDefinition {
-                name: tool.definition().name.clone(),
-                description: tool.definition().description.clone(),
-                input_schema: tool.definition().input_schema.clone(),
-            });
-        builtin.chain(plugin).collect()
+            .map(|entry| entry.definition.clone())
+            .collect()
     }
 
     #[must_use]
@@ -166,48 +206,83 @@ impl GlobalToolRegistry {
         &self,
         allowed_tools: Option<&BTreeSet<String>>,
     ) -> Vec<(String, PermissionMode)> {
-        let builtin = mvp_tool_specs()
-            .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
-            .map(|spec| (spec.name.to_string(), spec.required_permission));
-        let plugin = self
-            .plugin_tools
+        self.entries
             .iter()
-            .filter(|tool| {
-                allowed_tools.is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+            .filter(|entry| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(entry.definition.name.as_str()))
             })
-            .map(|tool| {
-                (
-                    tool.definition().name.clone(),
-                    permission_mode_from_plugin(tool.required_permission()),
-                )
-            });
-        builtin.chain(plugin).collect()
+            .map(|entry| (entry.definition.name.clone(), entry.required_permission))
+            .collect()
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
-        if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool(name, input);
+        let entry = self
+            .find_entry(name)
+            .ok_or_else(|| format!("unsupported tool: {name}"))?;
+        match &entry.handler {
+            RegisteredToolHandler::Builtin => execute_tool(&entry.definition.name, input),
+            RegisteredToolHandler::Plugin(tool) => {
+                tool.execute(input).map_err(|error| error.to_string())
+            }
         }
-        self.plugin_tools
-            .iter()
-            .find(|tool| tool.definition().name == name)
-            .ok_or_else(|| format!("unsupported tool: {name}"))?
-            .execute(input)
-            .map_err(|error| error.to_string())
     }
 }
 
-fn normalize_tool_name(value: &str) -> String {
-    value.trim().replace('-', "_").to_ascii_lowercase()
+impl Default for GlobalToolRegistry {
+    fn default() -> Self {
+        Self::builtin()
+    }
 }
 
-fn permission_mode_from_plugin(value: &str) -> PermissionMode {
+fn normalize_registry_tool_name(value: &str) -> String {
+    let trimmed = value.trim();
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    let mut normalized = String::new();
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if matches!(ch, '-' | ' ' | '\t' | '\n') {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            continue;
+        }
+
+        if ch == '_' {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            continue;
+        }
+
+        if ch.is_uppercase() {
+            let prev = chars.get(index.wrapping_sub(1)).copied();
+            let next = chars.get(index + 1).copied();
+            let needs_separator = index > 0
+                && !normalized.ends_with('_')
+                && (prev.is_some_and(|prev| prev.is_lowercase() || prev.is_ascii_digit())
+                    || (prev.is_some_and(char::is_uppercase)
+                        && next.is_some_and(char::is_lowercase)));
+            if needs_separator {
+                normalized.push('_');
+            }
+            normalized.extend(ch.to_lowercase());
+            continue;
+        }
+
+        normalized.push(ch.to_ascii_lowercase());
+    }
+
+    normalized.trim_matches('_').to_string()
+}
+
+fn permission_mode_from_plugin_tool(value: &str) -> Result<PermissionMode, String> {
     match value {
-        "read-only" => PermissionMode::ReadOnly,
-        "workspace-write" => PermissionMode::WorkspaceWrite,
-        "danger-full-access" => PermissionMode::DangerFullAccess,
-        other => panic!("unsupported plugin permission: {other}"),
+        "read-only" => Ok(PermissionMode::ReadOnly),
+        "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
+        "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
+        other => Err(format!(
+            "unsupported plugin tool permission `{other}` (expected read-only, workspace-write, or danger-full-access)"
+        )),
     }
 }
 
@@ -1628,8 +1703,9 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
+    let tool_registry = current_tool_registry()?;
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
-    let tool_executor = SubagentToolExecutor::new(allowed_tools);
+    let tool_executor = SubagentToolExecutor::new(allowed_tools, tool_registry);
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
@@ -1637,6 +1713,33 @@ fn build_agent_runtime(
         agent_permission_policy(),
         job.system_prompt.clone(),
     ))
+}
+
+fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
+    let config = ConfigLoader::new()
+        .load()
+        .map_err(|error| format!("failed to load configuration: {error}"))?;
+    let plugin_configs = config.feature_config().plugins();
+    if plugin_configs.is_empty() {
+        return Ok(GlobalToolRegistry::builtin());
+    }
+
+    let manager = build_plugin_manager(&config)?;
+    let registry = manager
+        .plugin_registry()
+        .map_err(|error| format!("failed to load plugin registry: {error}"))?;
+    let plugin_tools = registry
+        .tool_definitions()
+        .map_err(|error| format!("failed to get plugin tools: {error}"))?;
+    GlobalToolRegistry::with_plugin_tools(plugin_tools)
+}
+
+fn build_plugin_manager(config: &RuntimeConfig) -> Result<PluginManager, String> {
+    let config_home = config
+        .config_dir()
+        .unwrap_or_else(|| PathBuf::from(".claw"));
+    let manager_config = PluginManagerConfig::new(&config_home);
+    Ok(PluginManager::new(manager_config))
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -1932,11 +2035,15 @@ impl ApiClient for ProviderRuntimeClient {
 
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
+    tool_registry: GlobalToolRegistry,
 }
 
 impl SubagentToolExecutor {
-    fn new(allowed_tools: BTreeSet<String>) -> Self {
-        Self { allowed_tools }
+    fn new(allowed_tools: BTreeSet<String>, tool_registry: GlobalToolRegistry) -> Self {
+        Self {
+            allowed_tools,
+            tool_registry,
+        }
     }
 }
 
@@ -1949,7 +2056,9 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool(tool_name, &value).map_err(ToolError::new)
+        self.tool_registry
+            .execute(tool_name, &value)
+            .map_err(ToolError::new)
     }
 }
 
@@ -3073,7 +3182,7 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
         execute_tool, final_assistant_text, mvp_tool_specs, persist_agent_terminal_state,
-        push_output_block, AgentInput, AgentJob, SubagentToolExecutor,
+        push_output_block, AgentInput, AgentJob, GlobalToolRegistry, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, Session};
@@ -3757,7 +3866,7 @@ mod tests {
                 calls: 0,
                 input_path: path.display().to_string(),
             },
-            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
+            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")]), GlobalToolRegistry::builtin()),
             agent_permission_policy(),
             vec![String::from("system prompt")],
         );

@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 
+use serde_json::Value;
+
+use crate::config::RuntimePermissionRuleConfig;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionMode {
     ReadOnly,
@@ -22,12 +26,49 @@ impl PermissionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionOverride {
+    Allow,
+    Deny,
+    Ask,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PermissionContext {
+    override_decision: Option<PermissionOverride>,
+    override_reason: Option<String>,
+}
+
+impl PermissionContext {
+    #[must_use]
+    pub fn new(
+        override_decision: Option<PermissionOverride>,
+        override_reason: Option<String>,
+    ) -> Self {
+        Self {
+            override_decision,
+            override_reason,
+        }
+    }
+
+    #[must_use]
+    pub fn override_decision(&self) -> Option<PermissionOverride> {
+        self.override_decision
+    }
+
+    #[must_use]
+    pub fn override_reason(&self) -> Option<&str> {
+        self.override_reason.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRequest {
     pub tool_name: String,
     pub input: String,
     pub current_mode: PermissionMode,
     pub required_mode: PermissionMode,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +91,9 @@ pub enum PermissionOutcome {
 pub struct PermissionPolicy {
     active_mode: PermissionMode,
     tool_requirements: BTreeMap<String, PermissionMode>,
+    allow_rules: Vec<PermissionRule>,
+    deny_rules: Vec<PermissionRule>,
+    ask_rules: Vec<PermissionRule>,
 }
 
 impl PermissionPolicy {
@@ -58,6 +102,9 @@ impl PermissionPolicy {
         Self {
             active_mode,
             tool_requirements: BTreeMap::new(),
+            allow_rules: Vec::new(),
+            deny_rules: Vec::new(),
+            ask_rules: Vec::new(),
         }
     }
 
@@ -69,6 +116,14 @@ impl PermissionPolicy {
     ) -> Self {
         self.tool_requirements
             .insert(tool_name.into(), required_mode);
+        self
+    }
+
+    #[must_use]
+    pub fn with_permission_rules(mut self, rules: &RuntimePermissionRuleConfig) -> Self {
+        self.allow_rules = rules.allow().iter().map(|r| PermissionRule::parse(r)).collect();
+        self.deny_rules = rules.deny().iter().map(|r| PermissionRule::parse(r)).collect();
+        self.ask_rules = rules.ask().iter().map(|r| PermissionRule::parse(r)).collect();
         self
     }
 
@@ -90,38 +145,121 @@ impl PermissionPolicy {
         &self,
         tool_name: &str,
         input: &str,
-        mut prompter: Option<&mut dyn PermissionPrompter>,
+        prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
-        let current_mode = self.active_mode();
-        let required_mode = self.required_mode_for(tool_name);
-        if current_mode == PermissionMode::Allow || current_mode >= required_mode {
-            return PermissionOutcome::Allow;
+        self.authorize_with_context(tool_name, input, &PermissionContext::default(), prompter)
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn authorize_with_context(
+        &self,
+        tool_name: &str,
+        input: &str,
+        context: &PermissionContext,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
+        if let Some(rule) = Self::find_matching_rule(&self.deny_rules, tool_name, input) {
+            return PermissionOutcome::Deny {
+                reason: format!(
+                    "Permission to use {tool_name} has been denied by rule '{}'",
+                    rule.raw
+                ),
+            };
         }
 
-        let request = PermissionRequest {
-            tool_name: tool_name.to_string(),
-            input: input.to_string(),
-            current_mode,
-            required_mode,
-        };
+        let current_mode = self.active_mode();
+        let required_mode = self.required_mode_for(tool_name);
+        let ask_rule = Self::find_matching_rule(&self.ask_rules, tool_name, input);
+        let allow_rule = Self::find_matching_rule(&self.allow_rules, tool_name, input);
+
+        match context.override_decision() {
+            Some(PermissionOverride::Deny) => {
+                return PermissionOutcome::Deny {
+                    reason: context.override_reason().map_or_else(
+                        || format!("tool '{tool_name}' denied by hook"),
+                        ToOwned::to_owned,
+                    ),
+                };
+            }
+            Some(PermissionOverride::Ask) => {
+                let reason = context.override_reason().map_or_else(
+                    || format!("tool '{tool_name}' requires approval due to hook guidance"),
+                    ToOwned::to_owned,
+                );
+                return Self::prompt_or_deny(
+                    tool_name,
+                    input,
+                    current_mode,
+                    required_mode,
+                    Some(reason),
+                    prompter,
+                );
+            }
+            Some(PermissionOverride::Allow) => {
+                if let Some(rule) = ask_rule {
+                    let reason = format!(
+                        "tool '{tool_name}' requires approval due to ask rule '{}'",
+                        rule.raw
+                    );
+                    return Self::prompt_or_deny(
+                        tool_name,
+                        input,
+                        current_mode,
+                        required_mode,
+                        Some(reason),
+                        prompter,
+                    );
+                }
+                if allow_rule.is_some()
+                    || current_mode == PermissionMode::Allow
+                    || current_mode >= required_mode
+                {
+                    return PermissionOutcome::Allow;
+                }
+            }
+            None => {}
+        }
+
+        if let Some(rule) = ask_rule {
+            let reason = format!(
+                "tool '{tool_name}' requires approval due to ask rule '{}'",
+                rule.raw
+            );
+            return Self::prompt_or_deny(
+                tool_name,
+                input,
+                current_mode,
+                required_mode,
+                Some(reason),
+                prompter,
+            );
+        }
+
+        if allow_rule.is_some()
+            || current_mode == PermissionMode::Allow
+            || current_mode >= required_mode
+        {
+            return PermissionOutcome::Allow;
+        }
 
         if current_mode == PermissionMode::Prompt
             || (current_mode == PermissionMode::WorkspaceWrite
                 && required_mode == PermissionMode::DangerFullAccess)
         {
-            return match prompter.as_mut() {
-                Some(prompter) => match prompter.decide(&request) {
-                    PermissionPromptDecision::Allow => PermissionOutcome::Allow,
-                    PermissionPromptDecision::Deny { reason } => PermissionOutcome::Deny { reason },
-                },
-                None => PermissionOutcome::Deny {
-                    reason: format!(
-                        "tool '{tool_name}' requires approval to escalate from {} to {}",
-                        current_mode.as_str(),
-                        required_mode.as_str()
-                    ),
-                },
-            };
+            let reason = Some(format!(
+                "tool '{tool_name}' requires approval to escalate from {} to {}",
+                current_mode.as_str(),
+                required_mode.as_str()
+            ));
+            return Self::prompt_or_deny(
+                tool_name,
+                input,
+                current_mode,
+                required_mode,
+                reason,
+                prompter,
+            );
         }
 
         PermissionOutcome::Deny {
@@ -132,14 +270,191 @@ impl PermissionPolicy {
             ),
         }
     }
+
+    fn prompt_or_deny(
+        tool_name: &str,
+        input: &str,
+        current_mode: PermissionMode,
+        required_mode: PermissionMode,
+        reason: Option<String>,
+        mut prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
+        let request = PermissionRequest {
+            tool_name: tool_name.to_string(),
+            input: input.to_string(),
+            current_mode,
+            required_mode,
+            reason: reason.clone(),
+        };
+
+        match prompter.as_mut() {
+            Some(prompter) => match prompter.decide(&request) {
+                PermissionPromptDecision::Allow => PermissionOutcome::Allow,
+                PermissionPromptDecision::Deny { reason } => PermissionOutcome::Deny { reason },
+            },
+            None => PermissionOutcome::Deny {
+                reason: reason.unwrap_or_else(|| {
+                    format!(
+                        "tool '{tool_name}' requires approval to run while mode is {}",
+                        current_mode.as_str()
+                    )
+                }),
+            },
+        }
+    }
+
+    fn find_matching_rule<'a>(
+        rules: &'a [PermissionRule],
+        tool_name: &str,
+        input: &str,
+    ) -> Option<&'a PermissionRule> {
+        rules.iter().find(|rule| rule.matches(tool_name, input))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionRule {
+    raw: String,
+    tool_name: String,
+    matcher: PermissionRuleMatcher,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PermissionRuleMatcher {
+    Any,
+    Exact(String),
+    Prefix(String),
+}
+
+impl PermissionRule {
+    fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        let open = find_first_unescaped(trimmed, '(');
+        let close = find_last_unescaped(trimmed, ')');
+
+        if let (Some(open), Some(close)) = (open, close) {
+            if close == trimmed.len() - 1 && open < close {
+                let tool_name = trimmed[..open].trim();
+                let content = &trimmed[open + 1..close];
+                if !tool_name.is_empty() {
+                    let matcher = parse_rule_matcher(content);
+                    return Self {
+                        raw: trimmed.to_string(),
+                        tool_name: tool_name.to_string(),
+                        matcher,
+                    };
+                }
+            }
+        }
+
+        Self {
+            raw: trimmed.to_string(),
+            tool_name: trimmed.to_string(),
+            matcher: PermissionRuleMatcher::Any,
+        }
+    }
+
+    fn matches(&self, tool_name: &str, input: &str) -> bool {
+        if self.tool_name != tool_name {
+            return false;
+        }
+
+        match &self.matcher {
+            PermissionRuleMatcher::Any => true,
+            PermissionRuleMatcher::Exact(expected) => {
+                extract_permission_subject(input).is_some_and(|candidate| candidate == *expected)
+            }
+            PermissionRuleMatcher::Prefix(prefix) => extract_permission_subject(input)
+                .is_some_and(|candidate| candidate.starts_with(prefix)),
+        }
+    }
+}
+
+fn parse_rule_matcher(content: &str) -> PermissionRuleMatcher {
+    let unescaped = unescape_rule_content(content.trim());
+    if unescaped.is_empty() || unescaped == "*" {
+        PermissionRuleMatcher::Any
+    } else if let Some(prefix) = unescaped.strip_suffix(":*") {
+        PermissionRuleMatcher::Prefix(prefix.to_string())
+    } else {
+        PermissionRuleMatcher::Exact(unescaped)
+    }
+}
+
+fn unescape_rule_content(content: &str) -> String {
+    content
+        .replace(r"\(", "(")
+        .replace(r"\)", ")")
+        .replace(r"\\", r"\")
+}
+
+fn find_first_unescaped(value: &str, needle: char) -> Option<usize> {
+    let mut escaped = false;
+    for (idx, ch) in value.char_indices() {
+        if ch == '\\' {
+            escaped = !escaped;
+            continue;
+        }
+        if ch == needle && !escaped {
+            return Some(idx);
+        }
+        escaped = false;
+    }
+    None
+}
+
+fn find_last_unescaped(value: &str, needle: char) -> Option<usize> {
+    let chars = value.char_indices().collect::<Vec<_>>();
+    for (pos, (idx, ch)) in chars.iter().enumerate().rev() {
+        if *ch != needle {
+            continue;
+        }
+        let mut backslashes = 0;
+        for (_, prev) in chars[..pos].iter().rev() {
+            if *prev == '\\' {
+                backslashes += 1;
+            } else {
+                break;
+            }
+        }
+        if backslashes % 2 == 0 {
+            return Some(*idx);
+        }
+    }
+    None
+}
+
+fn extract_permission_subject(input: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(input).ok();
+    if let Some(Value::Object(object)) = parsed {
+        for key in [
+            "command",
+            "path",
+            "file_path",
+            "filePath",
+            "notebook_path",
+            "notebookPath",
+            "url",
+            "pattern",
+            "code",
+            "message",
+        ] {
+            if let Some(value) = object.get(key).and_then(Value::as_str) {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    (!input.trim().is_empty()).then(|| input.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
-        PermissionPrompter, PermissionRequest,
+        PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
+        PermissionPromptDecision, PermissionPrompter, PermissionRequest,
     };
+    use crate::config::RuntimePermissionRuleConfig;
 
     struct RecordingPrompter {
         seen: Vec<PermissionRequest>,
@@ -228,5 +543,61 @@ mod tests {
             policy.authorize("bash", "echo hi", Some(&mut prompter)),
             PermissionOutcome::Deny { reason } if reason == "not now"
         ));
+    }
+
+    #[test]
+    fn deny_rule_overrides_allow() {
+        let rules = RuntimePermissionRuleConfig::new(
+            vec!["bash".to_string()],
+            vec!["bash".to_string()],
+            Vec::new(),
+        );
+        let policy = PermissionPolicy::new(PermissionMode::Allow)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"rm -rf /"}"#, None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn allow_rule_grants_access() {
+        let rules = RuntimePermissionRuleConfig::new(
+            vec!["bash".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"echo hi"}"#, None),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn authorize_with_context_uses_override() {
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec!["bash".to_string()],
+            Vec::new(),
+        );
+        let policy = PermissionPolicy::new(PermissionMode::Allow)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+
+        // deny_rules always win regardless of context
+        let outcome = policy.authorize_with_context("bash", "{}", &PermissionContext::default(), None);
+        assert!(matches!(outcome, PermissionOutcome::Deny { .. }));
+
+        // context override Deny is honoured for non-deny-rule tools
+        let ctx = PermissionContext::new(Some(PermissionOverride::Deny), Some("hook denied".into()));
+        let policy2 = PermissionPolicy::new(PermissionMode::Allow);
+        let outcome2 = policy2.authorize_with_context("read", "{}", &ctx, None);
+        assert!(matches!(outcome2, PermissionOutcome::Deny { .. }));
     }
 }

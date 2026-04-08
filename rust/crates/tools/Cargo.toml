@@ -9,6 +9,7 @@ publish.workspace = true
 api = { path = "../api" }
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
+lsp-types.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true

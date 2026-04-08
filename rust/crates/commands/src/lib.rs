@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use plugins::{PluginError, PluginManager, PluginSummary};
-use runtime::{compact_session, CompactionConfig, Session};
+use plugins::{PluginError, PluginManager, PluginManagerConfig, PluginSummary};
+use runtime::{
+    compact_session, load_oauth_credentials, CompactionConfig, ConfigLoader, ConfigSource,
+    McpServerManager, McpTransport, RuntimeConfig, Session,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -121,7 +124,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "cost",
-        aliases: &[],
+        aliases: &["usage"],
         summary: "Show cumulative token usage for this session",
         argument_hint: None,
         resume_supported: true,
@@ -152,6 +155,14 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         category: SlashCommandCategory::Workspace,
     },
     SlashCommandSpec {
+        name: "context",
+        aliases: &[],
+        summary: "Show context window usage and prompt composition details",
+        argument_hint: None,
+        resume_supported: true,
+        category: SlashCommandCategory::Workspace,
+    },
+    SlashCommandSpec {
         name: "init",
         aliases: &[],
         summary: "Create a starter CLAW.md for this repo",
@@ -177,7 +188,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "bughunter",
-        aliases: &[],
+        aliases: &["bug"],
         summary: "Inspect the codebase for likely bugs",
         argument_hint: Some("[scope]"),
         resume_supported: false,
@@ -233,7 +244,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "ultraplan",
-        aliases: &[],
+        aliases: &["plan"],
         summary: "Run a deep planning prompt with multi-step reasoning",
         argument_hint: Some("[task]"),
         resume_supported: false,
@@ -264,6 +275,46 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         category: SlashCommandCategory::Session,
     },
     SlashCommandSpec {
+        name: "summary",
+        aliases: &[],
+        summary: "Generate a compact summary of the current conversation",
+        argument_hint: None,
+        resume_supported: true,
+        category: SlashCommandCategory::Session,
+    },
+    SlashCommandSpec {
+        name: "stats",
+        aliases: &[],
+        summary: "Show detailed local session statistics",
+        argument_hint: None,
+        resume_supported: true,
+        category: SlashCommandCategory::Session,
+    },
+    SlashCommandSpec {
+        name: "share",
+        aliases: &[],
+        summary: "Export a shareable transcript artifact",
+        argument_hint: Some("[file]"),
+        resume_supported: true,
+        category: SlashCommandCategory::Session,
+    },
+    SlashCommandSpec {
+        name: "rewind",
+        aliases: &[],
+        summary: "Trim the most recent conversation messages from this session",
+        argument_hint: Some("[steps]"),
+        resume_supported: true,
+        category: SlashCommandCategory::Session,
+    },
+    SlashCommandSpec {
+        name: "tag",
+        aliases: &[],
+        summary: "Attach a local tag to the active session",
+        argument_hint: Some("<tag>"),
+        resume_supported: true,
+        category: SlashCommandCategory::Session,
+    },
+    SlashCommandSpec {
         name: "session",
         aliases: &[],
         summary: "List or switch managed local sessions",
@@ -282,6 +333,94 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         category: SlashCommandCategory::Automation,
     },
     SlashCommandSpec {
+        name: "hooks",
+        aliases: &[],
+        summary: "List runtime and plugin hook registrations",
+        argument_hint: None,
+        resume_supported: true,
+        category: SlashCommandCategory::Automation,
+    },
+    SlashCommandSpec {
+        name: "reload-plugins",
+        aliases: &[],
+        summary: "Reload plugin manifests and refresh runtime features",
+        argument_hint: None,
+        resume_supported: false,
+        category: SlashCommandCategory::Automation,
+    },
+    SlashCommandSpec {
+        name: "mcp",
+        aliases: &[],
+        summary: "Inspect configured MCP servers and discovered tool surfaces",
+        argument_hint: Some("[list|tools|unsupported]"),
+        resume_supported: true,
+        category: SlashCommandCategory::Automation,
+    },
+    SlashCommandSpec {
+        name: "review",
+        aliases: &[],
+        summary: "Review the current workspace changes",
+        argument_hint: Some("[scope]"),
+        resume_supported: false,
+        category: SlashCommandCategory::Automation,
+    },
+    SlashCommandSpec {
+        name: "security-review",
+        aliases: &[],
+        summary: "Review the workspace with a security-first checklist",
+        argument_hint: Some("[scope]"),
+        resume_supported: false,
+        category: SlashCommandCategory::Automation,
+    },
+    SlashCommandSpec {
+        name: "doctor",
+        aliases: &[],
+        summary: "Run environment diagnostics for auth, tools, plugins, and MCP",
+        argument_hint: None,
+        resume_supported: true,
+        category: SlashCommandCategory::Automation,
+    },
+    SlashCommandSpec {
+        name: "tasks",
+        aliases: &[],
+        summary: "Create, inspect, and manage background task records",
+        argument_hint: Some("[list [status]|create <prompt>|show <id>|output <id>|tail <id>|pause <id>|resume <id>|stop <id>|cleanup [all|completed|failed|canceled|<id>]|update <id> --name <name> --description <desc> --model <model>]"),
+        resume_supported: true,
+        category: SlashCommandCategory::Automation,
+    },
+    SlashCommandSpec {
+        name: "login",
+        aliases: &[],
+        summary: "Authenticate and save local credentials",
+        argument_hint: None,
+        resume_supported: false,
+        category: SlashCommandCategory::Core,
+    },
+    SlashCommandSpec {
+        name: "logout",
+        aliases: &[],
+        summary: "Clear saved local credentials",
+        argument_hint: None,
+        resume_supported: false,
+        category: SlashCommandCategory::Core,
+    },
+    SlashCommandSpec {
+        name: "theme",
+        aliases: &[],
+        summary: "Show or persist the preferred terminal theme name",
+        argument_hint: Some("[theme-name]"),
+        resume_supported: true,
+        category: SlashCommandCategory::Core,
+    },
+    SlashCommandSpec {
+        name: "sandbox-toggle",
+        aliases: &[],
+        summary: "Toggle between read-only and workspace-write permission modes",
+        argument_hint: None,
+        resume_supported: false,
+        category: SlashCommandCategory::Core,
+    },
+    SlashCommandSpec {
         name: "agents",
         aliases: &[],
         summary: "List configured agents",
@@ -296,6 +435,30 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: None,
         resume_supported: true,
         category: SlashCommandCategory::Automation,
+    },
+    SlashCommandSpec {
+        name: "add-dir",
+        aliases: &[],
+        summary: "Add a workspace directory to the local settings file",
+        argument_hint: Some("<path>"),
+        resume_supported: true,
+        category: SlashCommandCategory::Workspace,
+    },
+    SlashCommandSpec {
+        name: "voice",
+        aliases: &[],
+        summary: "Record a local voice-mode preference for the CLI",
+        argument_hint: Some("[on|off]"),
+        resume_supported: true,
+        category: SlashCommandCategory::Core,
+    },
+    SlashCommandSpec {
+        name: "stickers",
+        aliases: &[],
+        summary: "Print a lightweight reaction sticker in the REPL",
+        argument_hint: Some("[name]"),
+        resume_supported: true,
+        category: SlashCommandCategory::Core,
     },
 ];
 
@@ -350,11 +513,23 @@ pub enum SlashCommand {
         section: Option<String>,
     },
     Memory,
+    Context,
     Init,
     Diff,
     Version,
     Export {
         path: Option<String>,
+    },
+    Summary,
+    Stats,
+    Share {
+        path: Option<String>,
+    },
+    Rewind {
+        steps: Option<String>,
+    },
+    Tag {
+        name: Option<String>,
     },
     Session {
         action: Option<String>,
@@ -364,17 +539,50 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
+    Hooks,
+    ReloadPlugins,
+    Mcp {
+        action: Option<String>,
+        target: Option<String>,
+    },
+    Review {
+        scope: Option<String>,
+    },
+    SecurityReview {
+        scope: Option<String>,
+    },
+    Doctor,
+    Tasks {
+        action: Option<String>,
+        target: Option<String>,
+    },
+    Login,
+    Logout,
+    Theme {
+        name: Option<String>,
+    },
+    SandboxToggle,
     Agents {
         args: Option<String>,
     },
     Skills {
         args: Option<String>,
     },
+    AddDir {
+        path: Option<String>,
+    },
+    Voice {
+        args: Option<String>,
+    },
+    Stickers {
+        name: Option<String>,
+    },
     Unknown(String),
 }
 
 impl SlashCommand {
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn parse(input: &str) -> Option<Self> {
         let trimmed = input.trim();
         if !trimmed.starts_with('/') {
@@ -387,12 +595,12 @@ impl SlashCommand {
             "help" => Self::Help,
             "status" => Self::Status,
             "compact" => Self::Compact,
+            "bug" | "bughunter" => Self::Bughunter {
+                scope: remainder_after_command(trimmed, command),
+            },
             "branch" => Self::Branch {
                 action: parts.next().map(ToOwned::to_owned),
                 target: parts.next().map(ToOwned::to_owned),
-            },
-            "bughunter" => Self::Bughunter {
-                scope: remainder_after_command(trimmed, command),
             },
             "worktree" => Self::Worktree {
                 action: parts.next().map(ToOwned::to_owned),
@@ -409,7 +617,7 @@ impl SlashCommand {
             "issue" => Self::Issue {
                 context: remainder_after_command(trimmed, command),
             },
-            "ultraplan" => Self::Ultraplan {
+            "plan" | "ultraplan" => Self::Ultraplan {
                 task: remainder_after_command(trimmed, command),
             },
             "teleport" => Self::Teleport {
@@ -425,7 +633,7 @@ impl SlashCommand {
             "clear" => Self::Clear {
                 confirm: parts.next() == Some("--confirm"),
             },
-            "cost" => Self::Cost,
+            "cost" | "usage" => Self::Cost,
             "resume" => Self::Resume {
                 session_path: parts.next().map(ToOwned::to_owned),
             },
@@ -433,11 +641,23 @@ impl SlashCommand {
                 section: parts.next().map(ToOwned::to_owned),
             },
             "memory" => Self::Memory,
+            "context" => Self::Context,
             "init" => Self::Init,
             "diff" => Self::Diff,
             "version" => Self::Version,
             "export" => Self::Export {
                 path: parts.next().map(ToOwned::to_owned),
+            },
+            "summary" => Self::Summary,
+            "stats" => Self::Stats,
+            "share" => Self::Share {
+                path: parts.next().map(ToOwned::to_owned),
+            },
+            "rewind" => Self::Rewind {
+                steps: parts.next().map(ToOwned::to_owned),
+            },
+            "tag" => Self::Tag {
+                name: remainder_after_command(trimmed, command),
             },
             "session" => Self::Session {
                 action: parts.next().map(ToOwned::to_owned),
@@ -450,14 +670,107 @@ impl SlashCommand {
                     (!remainder.is_empty()).then_some(remainder)
                 },
             },
+            "hooks" => Self::Hooks,
+            "reload-plugins" => Self::ReloadPlugins,
+            "mcp" => Self::Mcp {
+                action: parts.next().map(ToOwned::to_owned),
+                target: {
+                    let remainder = parts.collect::<Vec<_>>().join(" ");
+                    (!remainder.is_empty()).then_some(remainder)
+                },
+            },
+            "review" => Self::Review {
+                scope: remainder_after_command(trimmed, command),
+            },
+            "security-review" => Self::SecurityReview {
+                scope: remainder_after_command(trimmed, command),
+            },
+            "doctor" => Self::Doctor,
+            "tasks" => Self::Tasks {
+                action: parts.next().map(ToOwned::to_owned),
+                target: {
+                    let remainder = parts.collect::<Vec<_>>().join(" ");
+                    (!remainder.is_empty()).then_some(remainder)
+                },
+            },
+            "login" => Self::Login,
+            "logout" => Self::Logout,
+            "theme" => Self::Theme {
+                name: remainder_after_command(trimmed, command),
+            },
+            "sandbox-toggle" => Self::SandboxToggle,
             "agents" => Self::Agents {
                 args: remainder_after_command(trimmed, command),
             },
             "skills" => Self::Skills {
                 args: remainder_after_command(trimmed, command),
             },
+            "add-dir" => Self::AddDir {
+                path: remainder_after_command(trimmed, command),
+            },
+            "voice" => Self::Voice {
+                args: remainder_after_command(trimmed, command),
+            },
+            "stickers" => Self::Stickers {
+                name: remainder_after_command(trimmed, command),
+            },
             other => Self::Unknown(other.to_string()),
         })
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Help => "help",
+            Self::Status => "status",
+            Self::Compact => "compact",
+            Self::Branch { .. } => "branch",
+            Self::Bughunter { .. } => "bughunter",
+            Self::Worktree { .. } => "worktree",
+            Self::Commit => "commit",
+            Self::CommitPushPr { .. } => "commit-push-pr",
+            Self::Pr { .. } => "pr",
+            Self::Issue { .. } => "issue",
+            Self::Ultraplan { .. } => "ultraplan",
+            Self::Teleport { .. } => "teleport",
+            Self::DebugToolCall => "debug-tool-call",
+            Self::Model { .. } => "model",
+            Self::Permissions { .. } => "permissions",
+            Self::Clear { .. } => "clear",
+            Self::Cost => "cost",
+            Self::Resume { .. } => "resume",
+            Self::Config { .. } => "config",
+            Self::Memory => "memory",
+            Self::Context => "context",
+            Self::Init => "init",
+            Self::Diff => "diff",
+            Self::Version => "version",
+            Self::Export { .. } => "export",
+            Self::Summary => "summary",
+            Self::Stats => "stats",
+            Self::Share { .. } => "share",
+            Self::Rewind { .. } => "rewind",
+            Self::Tag { .. } => "tag",
+            Self::Session { .. } => "session",
+            Self::Plugins { .. } => "plugin",
+            Self::Hooks => "hooks",
+            Self::ReloadPlugins => "reload-plugins",
+            Self::Mcp { .. } => "mcp",
+            Self::Review { .. } => "review",
+            Self::SecurityReview { .. } => "security-review",
+            Self::Doctor => "doctor",
+            Self::Tasks { .. } => "tasks",
+            Self::Login => "login",
+            Self::Logout => "logout",
+            Self::Theme { .. } => "theme",
+            Self::SandboxToggle => "sandbox-toggle",
+            Self::Agents { .. } => "agents",
+            Self::Skills { .. } => "skills",
+            Self::AddDir { .. } => "add-dir",
+            Self::Voice { .. } => "voice",
+            Self::Stickers { .. } => "stickers",
+            Self::Unknown(_) => "unknown",
+        }
     }
 }
 
@@ -603,7 +916,7 @@ pub fn suggest_slash_commands(input: &str, limit: usize) -> Vec<String> {
         })
         .collect::<Vec<_>>();
 
-    ranked.sort_by(|left, right| left.cmp(right));
+    ranked.sort();
     ranked.dedup_by(|left, right| left.2 == right.2);
     ranked
         .into_iter()
@@ -822,6 +1135,257 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
     }
 }
 
+pub fn handle_hooks_slash_command(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader.load()?;
+    let manager = build_plugin_manager(cwd, &loader, &runtime_config);
+    let plugin_hooks = manager.aggregated_hooks().unwrap_or_default();
+    let enabled_plugins = manager
+        .list_installed_plugins()?
+        .into_iter()
+        .filter(|plugin| plugin.enabled)
+        .count();
+    let runtime_hooks = runtime_config.hooks();
+
+    let mut lines = vec![
+        "Hooks".to_string(),
+        format!(
+            "  Runtime hooks    pre={} post={} post-failure={}",
+            runtime_hooks.pre_tool_use().len(),
+            runtime_hooks.post_tool_use().len(),
+            runtime_hooks.post_tool_use_failure().len()
+        ),
+        format!(
+            "  Plugin hooks     pre={} post={} from {} enabled plugins",
+            plugin_hooks.pre_tool_use.len(),
+            plugin_hooks.post_tool_use.len(),
+            enabled_plugins
+        ),
+    ];
+
+    append_hook_section(
+        &mut lines,
+        "Runtime PreToolUse",
+        runtime_hooks.pre_tool_use(),
+        Some("config"),
+    );
+    append_hook_section(
+        &mut lines,
+        "Runtime PostToolUse",
+        runtime_hooks.post_tool_use(),
+        Some("config"),
+    );
+    append_hook_section(
+        &mut lines,
+        "Runtime PostToolUseFailure",
+        runtime_hooks.post_tool_use_failure(),
+        Some("config"),
+    );
+    append_hook_section(
+        &mut lines,
+        "Plugin PreToolUse",
+        &plugin_hooks.pre_tool_use,
+        Some("plugins"),
+    );
+    append_hook_section(
+        &mut lines,
+        "Plugin PostToolUse",
+        &plugin_hooks.post_tool_use,
+        Some("plugins"),
+    );
+
+    Ok(lines.join("\n"))
+}
+
+pub fn handle_mcp_slash_command(
+    action: Option<&str>,
+    cwd: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader.load()?;
+    let servers = runtime_config.mcp().servers();
+    let mut lines = vec![
+        "MCP".to_string(),
+        format!("  Configured servers {}", servers.len()),
+    ];
+
+    if servers.is_empty() {
+        lines.push("  No MCP servers configured.".to_string());
+        return Ok(lines.join("\n"));
+    }
+
+    for (name, scoped) in servers {
+        lines.push(format!(
+            "  {name:<16} scope={} transport={}",
+            config_source_label(scoped.scope),
+            transport_label(scoped.transport())
+        ));
+    }
+
+    let requested_action = action.unwrap_or("list");
+    if !matches!(requested_action, "list" | "tools" | "unsupported") {
+        lines.push(format!(
+            "  Unknown action '{requested_action}'. Use /mcp list, /mcp tools, or /mcp unsupported."
+        ));
+        return Ok(lines.join("\n"));
+    }
+
+    let mut manager = McpServerManager::from_runtime_config(&runtime_config);
+    let unsupported = manager.unsupported_servers().to_vec();
+
+    if matches!(requested_action, "list" | "unsupported") {
+        lines.push("Unsupported transports".to_string());
+        if unsupported.is_empty() {
+            lines.push("  None".to_string());
+        } else {
+            lines.extend(unsupported.into_iter().map(|server| {
+                format!(
+                    "  {} ({}) {}",
+                    server.server_name,
+                    transport_label(server.transport),
+                    server.reason
+                )
+            }));
+        }
+    }
+
+    if matches!(requested_action, "list" | "tools") {
+        lines.push("Discovered stdio tools".to_string());
+        let runtime = tokio::runtime::Runtime::new()?;
+        match runtime.block_on(manager.discover_tools()) {
+            Ok(tools) if tools.is_empty() => lines.push("  None".to_string()),
+            Ok(tools) => {
+                lines.extend(
+                    tools
+                        .into_iter()
+                        .map(|tool| format!("  {} -> {}", tool.server_name, tool.qualified_name)),
+                );
+            }
+            Err(error) => lines.push(format!("  Discovery failed: {error}")),
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
+pub fn handle_doctor_slash_command(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader.load()?;
+    let manager = build_plugin_manager(cwd, &loader, &runtime_config);
+    let plugin_count = manager.list_installed_plugins()?.len();
+    let oauth_saved = load_oauth_credentials()?.is_some();
+    let commands = [
+        ("git", command_exists("git")),
+        ("rg", command_exists("rg")),
+        ("gh", command_exists("gh")),
+        ("cargo", command_exists("cargo")),
+    ];
+
+    let mut lines = vec![
+        "Doctor".to_string(),
+        format!(
+            "  Config files     loaded {}",
+            runtime_config.loaded_entries().len()
+        ),
+        format!(
+            "  MCP servers      {} configured",
+            runtime_config.mcp().servers().len()
+        ),
+        format!("  Plugins          {} installed", plugin_count),
+        format!(
+            "  Auth             {}",
+            if oauth_saved || std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+                "available"
+            } else {
+                "missing"
+            }
+        ),
+        "Commands".to_string(),
+    ];
+    lines.extend(commands.into_iter().map(|(name, available)| {
+        format!(
+            "  {name:<16} {}",
+            if available { "available" } else { "missing" }
+        )
+    }));
+
+    Ok(lines.join("\n"))
+}
+
+fn append_hook_section(
+    lines: &mut Vec<String>,
+    title: &str,
+    values: &[String],
+    source: Option<&str>,
+) {
+    lines.push(title.to_string());
+    if values.is_empty() {
+        lines.push("  None".to_string());
+        return;
+    }
+    lines.extend(values.iter().map(|value| {
+        source.map_or_else(
+            || format!("  {value}"),
+            |source| format!("  [{source}] {value}"),
+        )
+    }));
+}
+
+fn build_plugin_manager(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &RuntimeConfig,
+) -> PluginManager {
+    let plugin_settings = runtime_config.plugins();
+    let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    plugin_config.external_dirs = plugin_settings
+        .external_directories()
+        .iter()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
+        .collect();
+    plugin_config.install_root = plugin_settings
+        .install_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.registry_path = plugin_settings
+        .registry_path()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.bundled_root = plugin_settings
+        .bundled_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    PluginManager::new(plugin_config)
+}
+
+fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if value.starts_with('.') {
+        cwd.join(path)
+    } else {
+        config_home.join(path)
+    }
+}
+
+const fn config_source_label(source: ConfigSource) -> &'static str {
+    match source {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    }
+}
+
+const fn transport_label(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Sse => "sse",
+        McpTransport::Http => "http",
+        McpTransport::Ws => "ws",
+        McpTransport::Sdk => "sdk",
+        McpTransport::ManagedProxy => "managed-proxy",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitPushPrRequest {
     pub commit_message: Option<String>,
@@ -842,7 +1406,7 @@ pub fn handle_branch_slash_command(
             Ok(if trimmed.is_empty() {
                 "Branch\n  Result           no branches found".to_string()
             } else {
-                format!("Branch\n  Result           listed\n\n{}", trimmed)
+                format!("Branch\n  Result           listed\n\n{trimmed}")
             })
         }
         Some("create") => {
@@ -882,7 +1446,7 @@ pub fn handle_worktree_slash_command(
             Ok(if trimmed.is_empty() {
                 "Worktree\n  Result           no worktrees found".to_string()
             } else {
-                format!("Worktree\n  Result           listed\n\n{}", trimmed)
+                format!("Worktree\n  Result           listed\n\n{trimmed}")
             })
         }
         Some("add") => {
@@ -1758,6 +2322,7 @@ pub fn handle_slash_command(
             session: session.clone(),
         }),
         SlashCommand::Status
+        | SlashCommand::Context
         | SlashCommand::Branch { .. }
         | SlashCommand::Bughunter { .. }
         | SlashCommand::Worktree { .. }
@@ -1779,10 +2344,29 @@ pub fn handle_slash_command(
         | SlashCommand::Diff
         | SlashCommand::Version
         | SlashCommand::Export { .. }
+        | SlashCommand::Summary
+        | SlashCommand::Stats
+        | SlashCommand::Share { .. }
+        | SlashCommand::Rewind { .. }
+        | SlashCommand::Tag { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
+        | SlashCommand::Hooks
+        | SlashCommand::ReloadPlugins
+        | SlashCommand::Mcp { .. }
+        | SlashCommand::Review { .. }
+        | SlashCommand::SecurityReview { .. }
+        | SlashCommand::Doctor
+        | SlashCommand::Tasks { .. }
+        | SlashCommand::Login
+        | SlashCommand::Logout
+        | SlashCommand::Theme { .. }
+        | SlashCommand::SandboxToggle
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Voice { .. }
+        | SlashCommand::Stickers { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -1790,21 +2374,17 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_branch_slash_command, handle_commit_push_pr_slash_command,
-        handle_commit_slash_command, handle_plugins_slash_command, handle_slash_command,
-        handle_worktree_slash_command, load_agents_from_roots, load_skills_from_roots,
-        render_agents_report, render_plugins_report, render_skills_report,
+        handle_branch_slash_command, handle_commit_slash_command, handle_plugins_slash_command,
+        handle_slash_command, handle_worktree_slash_command, load_agents_from_roots,
+        load_skills_from_roots, render_agents_report, render_plugins_report, render_skills_report,
         render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
-        suggest_slash_commands, CommitPushPrRequest, DefinitionSource, SkillOrigin, SkillRoot,
-        SlashCommand,
+        suggest_slash_commands, DefinitionSource, SkillOrigin, SkillRoot, SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{CompactionConfig, ContentBlock, ConversationMessage, MessageRole, Session};
-    use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
@@ -1816,13 +2396,6 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("commands-plugin-{label}-{nanos}"))
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
     }
 
     fn run_command(cwd: &Path, program: &str, args: &[&str]) -> String {
@@ -1873,17 +2446,6 @@ mod tests {
         fs::write(root.join("README.md"), "seed\n").expect("seed file");
         run_command(&root, "git", &["add", "README.md"]);
         run_command(&root, "git", &["commit", "-m", "chore: seed repo"]);
-        root
-    }
-
-    fn init_bare_repo(label: &str) -> PathBuf {
-        let root = temp_dir(label);
-        let output = Command::new("git")
-            .args(["init", "--bare"])
-            .arg(&root)
-            .output()
-            .expect("bare repo should initialize");
-        assert!(output.status.success(), "git init --bare should succeed");
         root
     }
 
@@ -2103,6 +2665,27 @@ mod tests {
                 target: Some("demo".to_string())
             })
         );
+        assert_eq!(
+            SlashCommand::parse("/tasks"),
+            Some(SlashCommand::Tasks {
+                action: None,
+                target: None,
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/tasks list running"),
+            Some(SlashCommand::Tasks {
+                action: Some("list".to_string()),
+                target: Some("running".to_string()),
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/tasks update task-123 --name reviewer --model gpt-5.4"),
+            Some(SlashCommand::Tasks {
+                action: Some("update".to_string()),
+                target: Some("task-123 --name reviewer --model gpt-5.4".to_string()),
+            })
+        );
     }
 
     #[test]
@@ -2143,17 +2726,24 @@ mod tests {
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
+        assert!(help.contains("/hooks"));
+        assert!(help.contains("/reload-plugins"));
+        assert!(help.contains("/mcp [list|tools|unsupported]"));
+        assert!(help.contains("/review [scope]"));
+        assert!(help.contains("/doctor"));
+        assert!(help.contains("/login"));
+        assert!(help.contains("/logout"));
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
-        assert_eq!(slash_command_specs().len(), 28);
-        assert_eq!(resume_supported_slash_commands().len(), 13);
+        assert_eq!(slash_command_specs().len(), 48);
+        assert_eq!(resume_supported_slash_commands().len(), 27);
     }
 
     #[test]
     fn suggests_close_slash_commands() {
         let suggestions = suggest_slash_commands("stats", 3);
         assert!(!suggestions.is_empty());
-        assert_eq!(suggestions[0], "/status");
+        assert_eq!(suggestions[0], "/stats");
     }
 
     #[test]

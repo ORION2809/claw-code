@@ -19,6 +19,13 @@ You can also install the binary locally:
 cargo install --path crates/claw-cli --locked
 ```
 
+Generate CLI artifacts locally:
+
+```bash
+cargo run -p claw-cli -- completions bash --output target/dist/claw.bash
+cargo run -p claw-cli -- manpage --output target/dist/claw.1
+```
+
 ## Provider setup
 
 Anthropic-compatible:
@@ -88,6 +95,7 @@ rust/
 
 - This workspace currently builds from source; packaged public releases are still limited.
 - Release notes for the current workspace live in `docs/releases/0.1.0.md`.
+- Contributor docs live in `docs/architecture.md`, `docs/tool-authoring.md`, and `docs/command-authoring.md`.
 - The default binary name is `claw`.
 
 ## Maintainer

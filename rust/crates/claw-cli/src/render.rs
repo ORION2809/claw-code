@@ -11,6 +11,8 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
+const SUPPORTED_THEME_NAMES: [&str; 4] = ["dark", "light", "solarized", "catppuccin"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColorTheme {
     heading: Color,
@@ -28,19 +30,168 @@ pub struct ColorTheme {
 
 impl Default for ColorTheme {
     fn default() -> Self {
-        Self {
-            heading: Color::Cyan,
-            emphasis: Color::Magenta,
-            strong: Color::Yellow,
-            inline_code: Color::Green,
-            link: Color::Blue,
-            quote: Color::DarkGrey,
-            table_border: Color::DarkCyan,
-            code_block_border: Color::DarkGrey,
-            spinner_active: Color::Blue,
-            spinner_done: Color::Green,
-            spinner_failed: Color::Red,
+        Self::for_theme("dark")
+    }
+}
+
+impl ColorTheme {
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn for_theme(name: &str) -> Self {
+        match normalize_theme_name(name).unwrap_or("dark") {
+            "light" => Self {
+                heading: Color::DarkBlue,
+                emphasis: Color::DarkMagenta,
+                strong: Color::DarkYellow,
+                inline_code: Color::DarkGreen,
+                link: Color::Blue,
+                quote: Color::Grey,
+                table_border: Color::DarkGrey,
+                code_block_border: Color::Grey,
+                spinner_active: Color::Blue,
+                spinner_done: Color::DarkGreen,
+                spinner_failed: Color::DarkRed,
+            },
+            "solarized" => Self {
+                heading: Color::Rgb {
+                    r: 38,
+                    g: 139,
+                    b: 210,
+                },
+                emphasis: Color::Rgb {
+                    r: 211,
+                    g: 54,
+                    b: 130,
+                },
+                strong: Color::Rgb {
+                    r: 181,
+                    g: 137,
+                    b: 0,
+                },
+                inline_code: Color::Rgb {
+                    r: 42,
+                    g: 161,
+                    b: 152,
+                },
+                link: Color::Rgb {
+                    r: 108,
+                    g: 113,
+                    b: 196,
+                },
+                quote: Color::Rgb {
+                    r: 88,
+                    g: 110,
+                    b: 117,
+                },
+                table_border: Color::Rgb {
+                    r: 88,
+                    g: 110,
+                    b: 117,
+                },
+                code_block_border: Color::Rgb {
+                    r: 101,
+                    g: 123,
+                    b: 131,
+                },
+                spinner_active: Color::Rgb {
+                    r: 38,
+                    g: 139,
+                    b: 210,
+                },
+                spinner_done: Color::Rgb {
+                    r: 133,
+                    g: 153,
+                    b: 0,
+                },
+                spinner_failed: Color::Rgb {
+                    r: 220,
+                    g: 50,
+                    b: 47,
+                },
+            },
+            "catppuccin" => Self {
+                heading: Color::Rgb {
+                    r: 137,
+                    g: 180,
+                    b: 250,
+                },
+                emphasis: Color::Rgb {
+                    r: 245,
+                    g: 194,
+                    b: 231,
+                },
+                strong: Color::Rgb {
+                    r: 249,
+                    g: 226,
+                    b: 175,
+                },
+                inline_code: Color::Rgb {
+                    r: 166,
+                    g: 227,
+                    b: 161,
+                },
+                link: Color::Rgb {
+                    r: 180,
+                    g: 190,
+                    b: 254,
+                },
+                quote: Color::Rgb {
+                    r: 127,
+                    g: 132,
+                    b: 156,
+                },
+                table_border: Color::Rgb {
+                    r: 108,
+                    g: 112,
+                    b: 134,
+                },
+                code_block_border: Color::Rgb {
+                    r: 88,
+                    g: 91,
+                    b: 112,
+                },
+                spinner_active: Color::Rgb {
+                    r: 137,
+                    g: 180,
+                    b: 250,
+                },
+                spinner_done: Color::Rgb {
+                    r: 166,
+                    g: 227,
+                    b: 161,
+                },
+                spinner_failed: Color::Rgb {
+                    r: 243,
+                    g: 139,
+                    b: 168,
+                },
+            },
+            _ => Self {
+                heading: Color::Cyan,
+                emphasis: Color::Magenta,
+                strong: Color::Yellow,
+                inline_code: Color::Green,
+                link: Color::Blue,
+                quote: Color::DarkGrey,
+                table_border: Color::DarkCyan,
+                code_block_border: Color::DarkGrey,
+                spinner_active: Color::Blue,
+                spinner_done: Color::Green,
+                spinner_failed: Color::Red,
+            },
         }
+    }
+}
+
+#[must_use]
+pub fn normalize_theme_name(name: &str) -> Option<&'static str> {
+    let normalized = name.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "dark" => Some("dark"),
+        "light" => Some("light"),
+        "solarized" | "solarized-dark" | "solarized-light" => Some("solarized"),
+        "catppuccin" | "latte" | "frappe" | "macchiato" | "mocha" => Some("catppuccin"),
+        _ => None,
     }
 }
 
@@ -223,23 +374,43 @@ pub struct TerminalRenderer {
 
 impl Default for TerminalRenderer {
     fn default() -> Self {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
-        let syntax_theme = ThemeSet::load_defaults()
-            .themes
-            .remove("base16-ocean.dark")
-            .unwrap_or_default();
-        Self {
-            syntax_set,
-            syntax_theme,
-            color_theme: ColorTheme::default(),
-        }
+        Self::with_theme_name(Some("dark"))
     }
 }
 
 impl TerminalRenderer {
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_theme_name(name: Option<&str>) -> Self {
+        let theme_name = name.and_then(normalize_theme_name).unwrap_or("dark");
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let mut theme_set = ThemeSet::load_defaults();
+        let syntax_theme_name = match theme_name {
+            "light" => "InspiredGitHub",
+            "solarized" => "Solarized (dark)",
+            "catppuccin" => "base16-eighties.dark",
+            _ => "base16-ocean.dark",
+        };
+        let syntax_theme = theme_set
+            .themes
+            .remove(syntax_theme_name)
+            .or_else(|| theme_set.themes.into_values().next())
+            .unwrap_or_default();
+        Self {
+            syntax_set,
+            syntax_theme,
+            color_theme: ColorTheme::for_theme(theme_name),
+        }
+    }
+
+    #[must_use]
+    pub fn supported_theme_names() -> &'static [&'static str] {
+        &SUPPORTED_THEME_NAMES
     }
 
     #[must_use]

@@ -296,9 +296,22 @@ impl PluginTool {
 
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
         let input_json = input.to_string();
-        let mut process = Command::new(&self.command);
+        let mut process = if cfg!(windows)
+            && Path::new(&self.command)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+                }) {
+            let mut process = Command::new("cmd");
+            process.arg("/C").arg(&self.command).args(&self.args);
+            process
+        } else {
+            let mut process = Command::new(&self.command);
+            process.args(&self.args);
+            process
+        };
         process
-            .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2142,7 +2155,7 @@ mod tests {
         write_file(
             &script_path,
             if cfg!(windows) {
-                "@echo off\r\npowershell -NoProfile -NonInteractive -Command \"$inputData = [Console]::In.ReadToEnd(); $payload = @{ plugin = $env:CLAW_PLUGIN_ID; tool = $env:CLAW_TOOL_NAME; input = ($inputData | ConvertFrom-Json) }; $payload | ConvertTo-Json -Compress\"\r\n"
+                "@echo off\r\nsetlocal EnableExtensions\r\necho {\"plugin\":\"%CLAW_PLUGIN_ID%\",\"tool\":\"%CLAW_TOOL_NAME%\",\"input\":%CLAW_TOOL_INPUT%}\r\n"
             } else {
                 "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAW_PLUGIN_ID\" \"$CLAW_TOOL_NAME\" \"$INPUT\"\n"
             },

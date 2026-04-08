@@ -1,3 +1,5 @@
 target/
 .omx/
 .clawd-agents/
+.claw-agents/
+.claw/

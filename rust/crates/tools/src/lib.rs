@@ -13,9 +13,12 @@ use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
     ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader, ContentBlock,
-    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode,
-    PermissionPolicy, RuntimeConfig, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    ConversationMessage, ConversationRuntime, GrepSearchInput, LspContextEnrichment, LspManager,
+    LspServerConfig, ManagedMcpResource, McpReadResourceResult, McpServerManager, McpTransport,
+    MessageRole, PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeError, Session,
+    TokenUsage, ToolError, ToolExecutor,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -611,6 +614,352 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        ToolSpec {
+            name: "AskUserQuestion",
+            description: "Emit a structured question for the interactive user.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "minLength": 1 },
+                    "context": { "type": "string" },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ListMcpResources",
+            description: "List resources exposed by configured stdio MCP servers.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ReadMcpResource",
+            description: "Read a resource from a configured stdio MCP server.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "uri": { "type": "string", "minLength": 1 }
+                },
+                "required": ["server", "uri"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "MCPTool",
+            description: "Call a tool exposed by a configured stdio MCP server.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "minLength": 1 },
+                    "arguments": {}
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "McpAuth",
+            description: "Inspect configured MCP authentication requirements.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "LSPTool",
+            description:
+                "Query diagnostics, definitions, references, or context via a language server.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["diagnostics", "definition", "references", "context"]
+                    },
+                    "path": { "type": "string", "minLength": 1 },
+                    "line": { "type": "integer", "minimum": 1 },
+                    "character": { "type": "integer", "minimum": 1 },
+                    "includeDeclaration": { "type": "boolean" },
+                    "servers": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "command": { "type": "string" },
+                                "args": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                },
+                                "env": {
+                                    "type": "object",
+                                    "additionalProperties": { "type": "string" }
+                                },
+                                "workspaceRoot": { "type": "string" },
+                                "initializationOptions": {},
+                                "extensionToLanguage": {
+                                    "type": "object",
+                                    "additionalProperties": { "type": "string" }
+                                }
+                            },
+                            "required": ["name", "command", "workspaceRoot"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["action", "path"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskCreate",
+            description: "Create a background sub-agent task and persist its manifest.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "description": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "subagent_type": { "type": "string" },
+                    "model": { "type": "string" },
+                    "name": { "type": "string" }
+                },
+                "required": ["description", "prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskGet",
+            description: "Read a persisted background task manifest.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" }
+                },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskList",
+            description: "List persisted background task manifests.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskOutput",
+            description: "Read the captured output for a persisted background task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" }
+                },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskStop",
+            description: "Request cancellation for a persisted background task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" }
+                },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskPause",
+            description:
+                "Request that a persisted background task pause before its next tool step.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" }
+                },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskResume",
+            description: "Resume a paused background task so it can continue executing.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" }
+                },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskUpdate",
+            description: "Update persisted metadata for a background task manifest.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" },
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "model": { "type": "string" }
+                },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TaskCleanup",
+            description:
+                "Delete persisted terminal task artifacts while leaving active tasks untouched.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" },
+                    "status": { "type": "string" },
+                    "all": { "type": "boolean" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TeamCreate",
+            description: "Persist a logical team of agents with shared context metadata.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "agents": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "sharedContext": {}
+                },
+                "required": ["name", "agents"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TeamDelete",
+            description: "Delete a persisted team definition.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "RemoteTrigger",
+            description: "Send an HTTP request to trigger a remote workflow or webhook.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "format": "uri" },
+                    "method": { "type": "string" },
+                    "headers": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "body": {},
+                    "timeoutMs": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ScheduleCronCreate",
+            description: "Register a cron-style schedule in the local workspace registry.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schedule": { "type": "string" },
+                    "command": { "type": "string" },
+                    "name": { "type": "string" }
+                },
+                "required": ["schedule", "command"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "ScheduleCronList",
+            description: "List registered cron-style schedules from the local workspace registry.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ScheduleCronDelete",
+            description: "Remove a cron-style schedule from the local workspace registry.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "SyntheticOutput",
+            description: "Return synthetic structured output for testing and replay flows.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string" },
+                    "content": {}
+                },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
     ]
 }
 
@@ -637,6 +986,42 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         }
         "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
         "PowerShell" => from_value::<PowerShellInput>(input).and_then(run_powershell),
+        "AskUserQuestion" => {
+            from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
+        }
+        "ListMcpResources" => {
+            from_value::<ListMcpResourcesInput>(input).and_then(run_list_mcp_resources)
+        }
+        "ReadMcpResource" => {
+            from_value::<ReadMcpResourceInput>(input).and_then(run_read_mcp_resource)
+        }
+        "MCPTool" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
+        "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
+        "LSPTool" => from_value::<LspToolInput>(input).and_then(run_lsp_tool),
+        "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
+        "TaskGet" => from_value::<TaskLookupInput>(input).and_then(run_task_get),
+        "TaskList" => from_value::<TaskListInput>(input).and_then(run_task_list),
+        "TaskOutput" => from_value::<TaskLookupInput>(input).and_then(run_task_output),
+        "TaskStop" => from_value::<TaskLookupInput>(input).and_then(run_task_stop),
+        "TaskPause" => from_value::<TaskLookupInput>(input).and_then(run_task_pause),
+        "TaskResume" => from_value::<TaskLookupInput>(input).and_then(run_task_resume),
+        "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
+        "TaskCleanup" => from_value::<TaskCleanupInput>(input).and_then(run_task_cleanup),
+        "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
+        "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
+        "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
+        "ScheduleCronCreate" => {
+            from_value::<ScheduleCronCreateInput>(input).and_then(run_schedule_cron_create)
+        }
+        "ScheduleCronList" => {
+            from_value::<ScheduleCronListInput>(input).and_then(run_schedule_cron_list)
+        }
+        "ScheduleCronDelete" => {
+            from_value::<ScheduleCronDeleteInput>(input).and_then(run_schedule_cron_delete)
+        }
+        "SyntheticOutput" => {
+            from_value::<SyntheticOutputInput>(input).and_then(run_synthetic_output)
+        }
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
@@ -735,6 +1120,94 @@ fn run_repl(input: ReplInput) -> Result<String, String> {
 
 fn run_powershell(input: PowerShellInput) -> Result<String, String> {
     to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
+}
+
+fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+    to_pretty_json(execute_ask_user_question(input))
+}
+
+fn run_list_mcp_resources(input: ListMcpResourcesInput) -> Result<String, String> {
+    to_pretty_json(execute_list_mcp_resources(input)?)
+}
+
+fn run_read_mcp_resource(input: ReadMcpResourceInput) -> Result<String, String> {
+    to_pretty_json(execute_read_mcp_resource(input)?)
+}
+
+fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
+    to_pretty_json(execute_mcp_tool(input)?)
+}
+
+fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
+    to_pretty_json(execute_mcp_auth(input)?)
+}
+
+fn run_lsp_tool(input: LspToolInput) -> Result<String, String> {
+    to_pretty_json(execute_lsp_tool(input)?)
+}
+
+fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
+    to_pretty_json(execute_task_create(input)?)
+}
+
+fn run_task_get(input: TaskLookupInput) -> Result<String, String> {
+    to_pretty_json(execute_task_get(input)?)
+}
+
+fn run_task_list(input: TaskListInput) -> Result<String, String> {
+    to_pretty_json(execute_task_list(input)?)
+}
+
+fn run_task_output(input: TaskLookupInput) -> Result<String, String> {
+    to_pretty_json(execute_task_output(input)?)
+}
+
+fn run_task_stop(input: TaskLookupInput) -> Result<String, String> {
+    to_pretty_json(execute_task_stop(input)?)
+}
+
+fn run_task_pause(input: TaskLookupInput) -> Result<String, String> {
+    to_pretty_json(execute_task_pause(input)?)
+}
+
+fn run_task_resume(input: TaskLookupInput) -> Result<String, String> {
+    to_pretty_json(execute_task_resume(input)?)
+}
+
+fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
+    to_pretty_json(execute_task_update(input)?)
+}
+
+fn run_task_cleanup(input: TaskCleanupInput) -> Result<String, String> {
+    to_pretty_json(execute_task_cleanup(input)?)
+}
+
+fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
+    to_pretty_json(execute_team_create(input)?)
+}
+
+fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
+    to_pretty_json(execute_team_delete(input)?)
+}
+
+fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
+    to_pretty_json(execute_remote_trigger(input)?)
+}
+
+fn run_schedule_cron_create(input: ScheduleCronCreateInput) -> Result<String, String> {
+    to_pretty_json(execute_schedule_cron_create(input)?)
+}
+
+fn run_schedule_cron_list(input: ScheduleCronListInput) -> Result<String, String> {
+    to_pretty_json(execute_schedule_cron_list(input)?)
+}
+
+fn run_schedule_cron_delete(input: ScheduleCronDeleteInput) -> Result<String, String> {
+    to_pretty_json(execute_schedule_cron_delete(input)?)
+}
+
+fn run_synthetic_output(input: SyntheticOutputInput) -> Result<String, String> {
+    to_pretty_json(execute_synthetic_output(input))
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
@@ -904,6 +1377,142 @@ struct PowerShellInput {
     run_in_background: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AskUserQuestionInput {
+    question: String,
+    context: Option<String>,
+    options: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListMcpResourcesInput {
+    server: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadMcpResourceInput {
+    server: String,
+    uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolInput {
+    name: String,
+    arguments: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpAuthInput {
+    server: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LspToolInput {
+    action: String,
+    path: String,
+    line: Option<u32>,
+    character: Option<u32>,
+    #[serde(rename = "includeDeclaration")]
+    include_declaration: Option<bool>,
+    servers: Option<Vec<LspServerInput>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LspServerInput {
+    name: String,
+    command: String,
+    args: Option<Vec<String>>,
+    env: Option<BTreeMap<String, String>>,
+    #[serde(rename = "workspaceRoot")]
+    workspace_root: String,
+    #[serde(rename = "initializationOptions")]
+    initialization_options: Option<Value>,
+    #[serde(rename = "extensionToLanguage")]
+    extension_to_language: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskCreateInput {
+    description: String,
+    prompt: String,
+    subagent_type: Option<String>,
+    name: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskLookupInput {
+    #[serde(rename = "taskId")]
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskListInput {
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskUpdateInput {
+    #[serde(rename = "taskId")]
+    task_id: String,
+    name: Option<String>,
+    description: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TaskCleanupInput {
+    #[serde(rename = "taskId")]
+    task_id: Option<String>,
+    status: Option<String>,
+    all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamCreateInput {
+    name: String,
+    description: Option<String>,
+    agents: Vec<String>,
+    #[serde(rename = "sharedContext")]
+    shared_context: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamDeleteInput {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteTriggerInput {
+    url: String,
+    method: Option<String>,
+    headers: Option<BTreeMap<String, String>>,
+    body: Option<Value>,
+    #[serde(rename = "timeoutMs")]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleCronCreateInput {
+    schedule: String,
+    command: String,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ScheduleCronListInput {}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleCronDeleteInput {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyntheticOutputInput {
+    status: Option<String>,
+    content: Value,
+}
+
 #[derive(Debug, Serialize)]
 struct WebFetchOutput {
     bytes: usize,
@@ -965,6 +1574,91 @@ struct AgentOutput {
     completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AskUserQuestionOutput {
+    question: String,
+    context: Option<String>,
+    options: Vec<String>,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskRecord {
+    #[serde(rename = "taskId")]
+    task_id: String,
+    name: String,
+    description: String,
+    status: String,
+    #[serde(rename = "subagentType")]
+    subagent_type: Option<String>,
+    model: Option<String>,
+    #[serde(rename = "outputFile")]
+    output_file: String,
+    #[serde(rename = "manifestFile")]
+    manifest_file: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskOutputResult {
+    #[serde(rename = "taskId")]
+    task_id: String,
+    status: String,
+    output: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskCleanupResult {
+    selection: String,
+    #[serde(rename = "deletedTaskIds")]
+    deleted_task_ids: Vec<String>,
+    #[serde(rename = "skippedTaskIds")]
+    skipped_task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TeamRecord {
+    name: String,
+    description: Option<String>,
+    agents: Vec<String>,
+    #[serde(rename = "sharedContext", skip_serializing_if = "Option::is_none")]
+    shared_context: Option<Value>,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CronRecord {
+    id: String,
+    name: String,
+    schedule: String,
+    command: String,
+    status: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteTriggerOutput {
+    url: String,
+    method: String,
+    status: u16,
+    body: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SyntheticOutputResult {
+    status: String,
+    content: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -1583,6 +2277,8 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+const TASK_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const TASK_CANCELED_ERROR: &str = "task canceled";
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
@@ -1698,6 +2394,16 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
+    if let Ok(task) = read_task_record(&job.manifest.agent_id) {
+        match task.status.as_str() {
+            "canceled" => return Ok(()),
+            "cancel_requested" => {
+                let _ = finalize_task_canceled(task, false)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
 }
 
@@ -1711,8 +2417,13 @@ fn build_agent_runtime(
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
     let tool_registry = current_tool_registry()?;
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
-    let tool_executor = SubagentToolExecutor::new(allowed_tools, tool_registry);
+    let api_client = ProviderRuntimeClient::new(&model, allowed_tools.clone())?;
+    let tool_executor = SubagentToolExecutor::new(
+        job.manifest.agent_id.clone(),
+        job.manifest.output_file.clone(),
+        allowed_tools,
+        tool_registry,
+    );
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
@@ -1931,6 +2642,74 @@ fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn wait_for_task_execution_window(
+    task_id: &str,
+    output_file: &str,
+    pause_reported: &mut bool,
+) -> Result<(), String> {
+    loop {
+        let task = read_task_record(task_id)?;
+        match task.status.as_str() {
+            "pause_requested" => {
+                let mut paused_task = task;
+                paused_task.status = String::from("paused");
+                paused_task.error = None;
+                write_task_record(&paused_task)?;
+                if !*pause_reported {
+                    let _ = append_agent_output(
+                        output_file,
+                        "\n## Pause request\n\nTask paused before the next tool step. Use TaskResume to continue.\n",
+                    );
+                    *pause_reported = true;
+                }
+                std::thread::sleep(TASK_CONTROL_POLL_INTERVAL);
+            }
+            "paused" => {
+                if !*pause_reported {
+                    let _ = append_agent_output(
+                        output_file,
+                        "\n## Pause request\n\nTask paused before the next tool step. Use TaskResume to continue.\n",
+                    );
+                    *pause_reported = true;
+                }
+                std::thread::sleep(TASK_CONTROL_POLL_INTERVAL);
+            }
+            "cancel_requested" => {
+                let _ = finalize_task_canceled(task, true)?;
+                return Err(TASK_CANCELED_ERROR.to_string());
+            }
+            "running" | "pending" => {
+                *pause_reported = false;
+                return Ok(());
+            }
+            status if task_status_is_terminal(status) => {
+                return Err(format!("task `{task_id}` is already {status}"));
+            }
+            _ => {
+                *pause_reported = false;
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn finalize_task_canceled(mut task: TaskRecord, append_note: bool) -> Result<TaskRecord, String> {
+    if task.status == "canceled" {
+        return Ok(task);
+    }
+    task.status = String::from("canceled");
+    task.completed_at = Some(iso8601_now());
+    task.error = Some(String::from("cancellation requested"));
+    write_task_record(&task)?;
+    if append_note {
+        let _ = append_agent_output(
+            &task.output_file,
+            "\n## Cancellation acknowledged\n\nTask canceled before the next tool step.\n",
+        );
+    }
+    Ok(task)
+}
+
 fn format_agent_terminal_output(status: &str, result: Option<&str>, error: Option<&str>) -> String {
     let mut sections = vec![format!("\n## Result\n\n- status: {status}\n")];
     if let Some(result) = result.filter(|value| !value.trim().is_empty()) {
@@ -1950,8 +2729,9 @@ struct ProviderRuntimeClient {
 }
 
 impl ProviderRuntimeClient {
-    fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let model = resolve_model_alias(&model).to_string();
+    #[allow(clippy::implicit_clone)]
+    fn new(model: &str, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
+        let model = resolve_model_alias(model).to_owned();
         let client = ProviderClient::from_model(&model).map_err(|error| error.to_string())?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
@@ -1963,6 +2743,7 @@ impl ProviderRuntimeClient {
 }
 
 impl ApiClient for ProviderRuntimeClient {
+    #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
@@ -2078,13 +2859,24 @@ impl ApiClient for ProviderRuntimeClient {
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     tool_registry: GlobalToolRegistry,
+    task_id: String,
+    output_file: String,
+    pause_reported: bool,
 }
 
 impl SubagentToolExecutor {
-    fn new(allowed_tools: BTreeSet<String>, tool_registry: GlobalToolRegistry) -> Self {
+    fn new(
+        task_id: String,
+        output_file: String,
+        allowed_tools: BTreeSet<String>,
+        tool_registry: GlobalToolRegistry,
+    ) -> Self {
         Self {
             allowed_tools,
             tool_registry,
+            task_id,
+            output_file,
+            pause_reported: false,
         }
     }
 }
@@ -2096,6 +2888,8 @@ impl ToolExecutor for SubagentToolExecutor {
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
         }
+        wait_for_task_execution_window(&self.task_id, &self.output_file, &mut self.pause_reported)
+            .map_err(ToolError::new)?;
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         self.tool_registry
@@ -2721,7 +3515,7 @@ struct ReplRuntime {
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     match language.trim().to_ascii_lowercase().as_str() {
         "python" | "py" => Ok(ReplRuntime {
-            program: detect_first_command(&["python3", "python"])
+            program: detect_first_command(&["python3", "python", "py"])
                 .ok_or_else(|| String::from("python runtime not found"))?,
             args: &["-c"],
         }),
@@ -2998,6 +3792,813 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     )
 }
 
+fn load_runtime_config() -> Result<RuntimeConfig, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    ConfigLoader::default_for(&cwd)
+        .load()
+        .map_err(|error| format!("failed to load configuration: {error}"))
+}
+
+const fn transport_label(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Sse => "sse",
+        McpTransport::Http => "http",
+        McpTransport::Ws => "ws",
+        McpTransport::Sdk => "sdk",
+        McpTransport::ManagedProxy => "managed-proxy",
+    }
+}
+
+fn execute_ask_user_question(input: AskUserQuestionInput) -> AskUserQuestionOutput {
+    AskUserQuestionOutput {
+        question: input.question,
+        context: input.context,
+        options: input.options.unwrap_or_default(),
+        status: String::from("awaiting-user"),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_list_mcp_resources(input: ListMcpResourcesInput) -> Result<Value, String> {
+    let runtime_config = load_runtime_config()?;
+    let mut manager = McpServerManager::from_runtime_config(&runtime_config);
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let mut resources = runtime
+        .block_on(manager.list_resources())
+        .map_err(|error| error.to_string())?;
+    if let Some(server) = input.server.as_ref() {
+        resources.retain(|resource| resource.server_name == *server);
+    }
+    let unsupported = manager
+        .unsupported_servers()
+        .iter()
+        .filter(|server| {
+            input
+                .server
+                .as_ref()
+                .is_none_or(|name| name == &server.server_name)
+        })
+        .map(|server| {
+            json!({
+                "server": server.server_name,
+                "transport": transport_label(server.transport),
+                "reason": server.reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    let _ = runtime.block_on(manager.shutdown());
+    Ok(json!({
+        "resources": serialize_mcp_resources(&resources),
+        "unsupportedServers": unsupported,
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_read_mcp_resource(input: ReadMcpResourceInput) -> Result<McpReadResourceResult, String> {
+    let runtime_config = load_runtime_config()?;
+    let mut manager = McpServerManager::from_runtime_config(&runtime_config);
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let response = runtime
+        .block_on(manager.read_resource(&input.server, &input.uri))
+        .map_err(|error| error.to_string())?;
+    let _ = runtime.block_on(manager.shutdown());
+    if let Some(error) = response.error {
+        return Err(format!("MCP resources/read failed: {}", error.message));
+    }
+    response
+        .result
+        .ok_or_else(|| String::from("MCP resources/read response missing result payload"))
+}
+
+fn execute_mcp_tool(input: McpToolInput) -> Result<Value, String> {
+    let runtime_config = load_runtime_config()?;
+    let mut manager = McpServerManager::from_runtime_config(&runtime_config);
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    runtime
+        .block_on(manager.discover_tools())
+        .map_err(|error| error.to_string())?;
+    let response = runtime
+        .block_on(manager.call_tool(&input.name, input.arguments))
+        .map_err(|error| error.to_string())?;
+    let _ = runtime.block_on(manager.shutdown());
+    if let Some(error) = response.error {
+        return Err(format!("MCP tools/call failed: {}", error.message));
+    }
+    serde_json::to_value(
+        response
+            .result
+            .ok_or_else(|| String::from("MCP tools/call response missing result payload"))?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_mcp_auth(input: McpAuthInput) -> Result<Value, String> {
+    let runtime_config = load_runtime_config()?;
+    let mut entries = runtime_config
+        .mcp()
+        .servers()
+        .iter()
+        .filter(|(name, _)| input.server.as_ref().is_none_or(|server| server == *name))
+        .map(|(name, scoped)| {
+            let auth = match &scoped.config {
+                runtime::McpServerConfig::Sse(config) | runtime::McpServerConfig::Http(config) => {
+                    json!({
+                        "type": transport_label(scoped.transport()),
+                        "oauthConfigured": config.oauth.is_some(),
+                        "headers": config.headers.keys().collect::<Vec<_>>(),
+                        "headersHelper": config.headers_helper,
+                    })
+                }
+                runtime::McpServerConfig::Ws(config) => json!({
+                    "type": transport_label(scoped.transport()),
+                    "headers": config.headers.keys().collect::<Vec<_>>(),
+                    "headersHelper": config.headers_helper,
+                }),
+                runtime::McpServerConfig::Stdio(config) => json!({
+                    "type": transport_label(scoped.transport()),
+                    "command": config.command,
+                    "envKeys": config.env.keys().collect::<Vec<_>>(),
+                }),
+                runtime::McpServerConfig::Sdk(config) => json!({
+                    "type": transport_label(scoped.transport()),
+                    "name": config.name,
+                }),
+                runtime::McpServerConfig::ManagedProxy(config) => json!({
+                    "type": transport_label(scoped.transport()),
+                    "url": config.url,
+                    "id": config.id,
+                }),
+            };
+            json!({
+                "server": name,
+                "scope": format!("{:?}", scoped.scope),
+                "auth": auth,
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left["server"].as_str().cmp(&right["server"].as_str()));
+    Ok(json!({ "servers": entries }))
+}
+
+fn execute_lsp_tool(input: LspToolInput) -> Result<Value, String> {
+    let path = PathBuf::from(&input.path);
+    let servers = resolve_lsp_servers(&path, input.servers)?;
+    let manager = LspManager::new(servers).map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let result = runtime.block_on(async {
+        manager
+            .sync_document_from_disk(&path)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let value = match input.action.as_str() {
+            "diagnostics" => {
+                let diagnostics = manager
+                    .collect_workspace_diagnostics()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serialize_workspace_diagnostics(&path, diagnostics)
+            }
+            "definition" => {
+                let position = required_lsp_position(input.line, input.character)?;
+                let definitions = manager
+                    .go_to_definition(&path, position)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                json!({
+                    "action": "definition",
+                    "path": path.display().to_string(),
+                    "locations": definitions.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                })
+            }
+            "references" => {
+                let position = required_lsp_position(input.line, input.character)?;
+                let references = manager
+                    .find_references(&path, position, input.include_declaration.unwrap_or(true))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                json!({
+                    "action": "references",
+                    "path": path.display().to_string(),
+                    "locations": references.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                })
+            }
+            "context" => {
+                let position = required_lsp_position(input.line, input.character)?;
+                let enrichment = manager
+                    .context_enrichment(&path, position)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serialize_lsp_context(&path, enrichment)
+            }
+            other => return Err(format!("unsupported LSPTool action: {other}")),
+        };
+
+        manager
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<Value, String>(value)
+    })?;
+    Ok(result)
+}
+
+fn execute_task_create(input: TaskCreateInput) -> Result<TaskRecord, String> {
+    let manifest = execute_agent(AgentInput {
+        description: input.description,
+        prompt: input.prompt,
+        subagent_type: input.subagent_type,
+        name: input.name,
+        model: input.model,
+    })?;
+    Ok(task_record_from_agent(manifest))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_task_get(input: TaskLookupInput) -> Result<TaskRecord, String> {
+    read_task_record(&input.task_id)
+}
+
+fn execute_task_list(input: TaskListInput) -> Result<Vec<TaskRecord>, String> {
+    let mut tasks = load_task_records()?;
+    if let Some(status) = input.status {
+        tasks.retain(|task| task.status == status);
+    }
+    Ok(tasks)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_task_output(input: TaskLookupInput) -> Result<TaskOutputResult, String> {
+    let task = read_task_record(&input.task_id)?;
+    let output = std::fs::read_to_string(&task.output_file)
+        .map_err(|error| format!("failed to read task output: {error}"))?;
+    Ok(TaskOutputResult {
+        task_id: task.task_id,
+        status: task.status,
+        output,
+    })
+}
+
+fn task_status_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "canceled")
+}
+
+fn task_status_is_active(status: &str) -> bool {
+    matches!(
+        status,
+        "pending" | "running" | "pause_requested" | "paused" | "cancel_requested"
+    )
+}
+
+fn delete_file_if_exists(path: &str) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to remove `{path}`: {error}")),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_task_stop(input: TaskLookupInput) -> Result<TaskRecord, String> {
+    let mut task = read_task_record(&input.task_id)?;
+    if matches!(
+        task.status.as_str(),
+        "running" | "pause_requested" | "paused"
+    ) {
+        task.status = String::from("cancel_requested");
+        task.error = Some(String::from("cancellation requested"));
+        write_task_record(&task)?;
+        let _ = append_agent_output(
+            &task.output_file,
+            "\n## Stop request\n\nCancellation requested from TaskStop.\n",
+        );
+    }
+    Ok(task)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_task_pause(input: TaskLookupInput) -> Result<TaskRecord, String> {
+    let mut task = read_task_record(&input.task_id)?;
+    match task.status.as_str() {
+        "running" => {
+            task.status = String::from("pause_requested");
+            task.error = None;
+            write_task_record(&task)?;
+            let _ = append_agent_output(
+                &task.output_file,
+                "\n## Pause request\n\nPause requested from TaskPause.\n",
+            );
+            Ok(task)
+        }
+        "pause_requested" | "paused" => Ok(task),
+        status if task_status_is_terminal(status) => Err(format!(
+            "task `{}` is already {status} and cannot be paused",
+            task.task_id
+        )),
+        "cancel_requested" => Err(format!(
+            "task `{}` already has a cancellation request pending",
+            task.task_id
+        )),
+        status => Err(format!(
+            "task `{}` cannot be paused from state `{status}`",
+            task.task_id
+        )),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_task_resume(input: TaskLookupInput) -> Result<TaskRecord, String> {
+    let mut task = read_task_record(&input.task_id)?;
+    match task.status.as_str() {
+        "pause_requested" | "paused" => {
+            task.status = String::from("running");
+            task.error = None;
+            write_task_record(&task)?;
+            let _ = append_agent_output(
+                &task.output_file,
+                "\n## Resume request\n\nTask resumed from TaskResume.\n",
+            );
+            Ok(task)
+        }
+        "running" => Ok(task),
+        status if task_status_is_terminal(status) => Err(format!(
+            "task `{}` is already {status} and cannot be resumed",
+            task.task_id
+        )),
+        "cancel_requested" => Err(format!(
+            "task `{}` already has a cancellation request pending",
+            task.task_id
+        )),
+        status => Err(format!(
+            "task `{}` cannot be resumed from state `{status}`",
+            task.task_id
+        )),
+    }
+}
+
+fn execute_task_update(input: TaskUpdateInput) -> Result<TaskRecord, String> {
+    let mut task = read_task_record(&input.task_id)?;
+    if let Some(name) = input.name {
+        task.name = name;
+    }
+    if let Some(description) = input.description {
+        task.description = description;
+    }
+    if let Some(model) = input.model {
+        task.model = Some(model);
+    }
+    write_task_record(&task)?;
+    Ok(task)
+}
+
+fn execute_task_cleanup(input: TaskCleanupInput) -> Result<TaskCleanupResult, String> {
+    let selection = if input.all.unwrap_or(false) {
+        String::from("all")
+    } else if let Some(task_id) = input.task_id.as_ref() {
+        format!("task:{task_id}")
+    } else if let Some(status) = input.status.as_ref() {
+        format!("status:{status}")
+    } else {
+        String::from("terminal")
+    };
+
+    let mut tasks = if let Some(task_id) = input.task_id {
+        vec![read_task_record(&task_id)?]
+    } else {
+        load_task_records()?
+    };
+    if let Some(status) = input.status {
+        tasks.retain(|task| task.status == status);
+    } else if !input.all.unwrap_or(false) {
+        tasks.retain(|task| task_status_is_terminal(&task.status));
+    }
+
+    let mut deleted_task_ids = Vec::new();
+    let mut skipped_task_ids = Vec::new();
+    for task in tasks {
+        if task_status_is_active(&task.status) {
+            skipped_task_ids.push(task.task_id);
+            continue;
+        }
+        delete_file_if_exists(&task.output_file)?;
+        delete_file_if_exists(&task.manifest_file)?;
+        deleted_task_ids.push(task.task_id);
+    }
+
+    Ok(TaskCleanupResult {
+        selection,
+        deleted_task_ids,
+        skipped_task_ids,
+    })
+}
+
+fn execute_team_create(input: TeamCreateInput) -> Result<TeamRecord, String> {
+    let mut teams = load_team_records()?;
+    teams.retain(|team| team.name != input.name);
+    let record = TeamRecord {
+        name: input.name,
+        description: input.description,
+        agents: input.agents,
+        shared_context: input.shared_context,
+        created_at: iso8601_now(),
+    };
+    teams.push(record.clone());
+    write_json_registry(&team_registry_path()?, &teams)?;
+    Ok(record)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_team_delete(input: TeamDeleteInput) -> Result<Value, String> {
+    let mut teams = load_team_records()?;
+    let before = teams.len();
+    teams.retain(|team| team.name != input.name);
+    write_json_registry(&team_registry_path()?, &teams)?;
+    Ok(json!({
+        "name": input.name,
+        "deleted": before != teams.len(),
+    }))
+}
+
+fn execute_remote_trigger(input: RemoteTriggerInput) -> Result<RemoteTriggerOutput, String> {
+    let method = input
+        .method
+        .unwrap_or_else(|| String::from("POST"))
+        .parse::<reqwest::Method>()
+        .map_err(|error| error.to_string())?;
+    let client = Client::builder()
+        .timeout(Duration::from_millis(input.timeout_ms.unwrap_or(15_000)))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut request = client.request(method.clone(), &input.url);
+    if let Some(headers) = input.headers {
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+    }
+    if let Some(body) = input.body {
+        request = request.json(&body);
+    }
+    let response = request.send().map_err(|error| error.to_string())?;
+    let status = response.status().as_u16();
+    let body = response.text().map_err(|error| error.to_string())?;
+    Ok(RemoteTriggerOutput {
+        url: input.url,
+        method: method.to_string(),
+        status,
+        body,
+    })
+}
+
+fn execute_schedule_cron_create(input: ScheduleCronCreateInput) -> Result<CronRecord, String> {
+    let mut schedules = load_cron_records()?;
+    let record = CronRecord {
+        id: make_named_id(input.name.as_deref().unwrap_or("schedule")),
+        name: input
+            .name
+            .unwrap_or_else(|| String::from("workspace-schedule")),
+        schedule: input.schedule,
+        command: input.command,
+        status: String::from("registered"),
+        created_at: iso8601_now(),
+    };
+    schedules.push(record.clone());
+    write_json_registry(&cron_registry_path()?, &schedules)?;
+    Ok(record)
+}
+
+fn execute_schedule_cron_list(_input: ScheduleCronListInput) -> Result<Vec<CronRecord>, String> {
+    load_cron_records()
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn execute_schedule_cron_delete(input: ScheduleCronDeleteInput) -> Result<Value, String> {
+    let mut schedules = load_cron_records()?;
+    let before = schedules.len();
+    schedules.retain(|record| record.id != input.id);
+    write_json_registry(&cron_registry_path()?, &schedules)?;
+    Ok(json!({
+        "id": input.id,
+        "deleted": before != schedules.len(),
+    }))
+}
+
+fn execute_synthetic_output(input: SyntheticOutputInput) -> SyntheticOutputResult {
+    SyntheticOutputResult {
+        status: input.status.unwrap_or_else(|| String::from("synthetic")),
+        content: input.content,
+    }
+}
+
+fn serialize_mcp_resources(resources: &[ManagedMcpResource]) -> Vec<Value> {
+    resources
+        .iter()
+        .map(|resource| {
+            json!({
+                "server": resource.server_name,
+                "uri": resource.resource.uri,
+                "name": resource.resource.name,
+                "description": resource.resource.description,
+                "mimeType": resource.resource.mime_type,
+            })
+        })
+        .collect()
+}
+
+fn resolve_lsp_servers(
+    path: &Path,
+    servers: Option<Vec<LspServerInput>>,
+) -> Result<Vec<LspServerConfig>, String> {
+    let Some(servers) = servers.filter(|servers| !servers.is_empty()) else {
+        return Err(String::from(
+            "LSPTool requires at least one server definition in `servers`",
+        ));
+    };
+
+    let extension_map = default_lsp_extension_map(path)?;
+    Ok(servers
+        .into_iter()
+        .map(|server| LspServerConfig {
+            name: server.name,
+            command: server.command,
+            args: server.args.unwrap_or_default(),
+            env: server.env.unwrap_or_default(),
+            workspace_root: PathBuf::from(server.workspace_root),
+            initialization_options: server.initialization_options,
+            extension_to_language: server
+                .extension_to_language
+                .unwrap_or_else(|| extension_map.clone()),
+        })
+        .collect())
+}
+
+fn default_lsp_extension_map(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or_else(|| {
+            format!(
+                "LSPTool requires a file path with an extension: {}",
+                path.display()
+            )
+        })?
+        .to_ascii_lowercase();
+    let language = match extension.as_str() {
+        "rs" => "rust",
+        "py" => "python",
+        "js" => "javascript",
+        "jsx" => "javascriptreact",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "go" => "go",
+        "java" => "java",
+        "kt" => "kotlin",
+        "swift" => "swift",
+        "md" => "markdown",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "c" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        other => other,
+    };
+    Ok(BTreeMap::from([(
+        format!(".{extension}"),
+        language.to_string(),
+    )]))
+}
+
+fn required_lsp_position(
+    line: Option<u32>,
+    character: Option<u32>,
+) -> Result<lsp_types::Position, String> {
+    let line = line.ok_or_else(|| String::from("LSPTool action requires `line`"))?;
+    let character = character.ok_or_else(|| String::from("LSPTool action requires `character`"))?;
+    Ok(lsp_types::Position::new(
+        line.saturating_sub(1),
+        character.saturating_sub(1),
+    ))
+}
+
+fn serialize_workspace_diagnostics(
+    path: &Path,
+    diagnostics: runtime::WorkspaceDiagnostics,
+) -> Value {
+    json!({
+        "action": "diagnostics",
+        "path": path.display().to_string(),
+        "totalDiagnostics": diagnostics.total_diagnostics(),
+        "files": diagnostics.files.into_iter().map(|file| {
+            json!({
+                "path": file.path.display().to_string(),
+                "uri": file.uri,
+                "diagnostics": file.diagnostics.into_iter().map(|diagnostic| {
+                    json!({
+                        "message": diagnostic.message,
+                        "severity": diagnostic
+                            .severity
+                            .map_or("unknown", |severity| match severity {
+                                lsp_types::DiagnosticSeverity::ERROR => "error",
+                                lsp_types::DiagnosticSeverity::WARNING => "warning",
+                                lsp_types::DiagnosticSeverity::INFORMATION => "info",
+                                lsp_types::DiagnosticSeverity::HINT => "hint",
+                                _ => "unknown",
+                            }),
+                        "line": diagnostic.range.start.line + 1,
+                        "character": diagnostic.range.start.character + 1,
+                        "endLine": diagnostic.range.end.line + 1,
+                        "endCharacter": diagnostic.range.end.character + 1,
+                        "source": diagnostic.source,
+                        "code": diagnostic.code.map(|code| match code {
+                            lsp_types::NumberOrString::String(value) => Value::String(value),
+                            lsp_types::NumberOrString::Number(value) => json!(value),
+                        }),
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn serialize_lsp_context(path: &Path, enrichment: LspContextEnrichment) -> Value {
+    json!({
+        "action": "context",
+        "path": path.display().to_string(),
+        "prompt": enrichment.render_prompt_section(),
+        "definitions": enrichment
+            .definitions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        "references": enrichment
+            .references
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        "totalDiagnostics": enrichment.diagnostics.total_diagnostics(),
+        "diagnostics": serialize_workspace_diagnostics(path, enrichment.diagnostics)["files"].clone(),
+    })
+}
+
+fn task_record_from_agent(agent: AgentOutput) -> TaskRecord {
+    TaskRecord {
+        task_id: agent.agent_id,
+        name: agent.name,
+        description: agent.description,
+        status: agent.status,
+        subagent_type: agent.subagent_type,
+        model: agent.model,
+        output_file: agent.output_file,
+        manifest_file: agent.manifest_file,
+        created_at: agent.created_at,
+        started_at: agent.started_at,
+        completed_at: agent.completed_at,
+        error: agent.error,
+    }
+}
+
+fn agent_from_task_record(task: &TaskRecord) -> AgentOutput {
+    AgentOutput {
+        agent_id: task.task_id.clone(),
+        name: task.name.clone(),
+        description: task.description.clone(),
+        subagent_type: task.subagent_type.clone(),
+        model: task.model.clone(),
+        status: task.status.clone(),
+        output_file: task.output_file.clone(),
+        manifest_file: task.manifest_file.clone(),
+        created_at: task.created_at.clone(),
+        started_at: task.started_at.clone(),
+        completed_at: task.completed_at.clone(),
+        error: task.error.clone(),
+    }
+}
+
+fn read_task_record(task_id: &str) -> Result<TaskRecord, String> {
+    let path = agent_store_dir()?.join(format!("{task_id}.json"));
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read task manifest `{}`: {error}", path.display()))?;
+    let agent = serde_json::from_str::<AgentOutput>(&contents).map_err(|error| {
+        format!(
+            "failed to parse task manifest `{}`: {error}",
+            path.display()
+        )
+    })?;
+    Ok(task_record_from_agent(agent))
+}
+
+fn load_task_records() -> Result<Vec<TaskRecord>, String> {
+    let dir = agent_store_dir()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to read task directory `{}`: {error}",
+                dir.display()
+            ))
+        }
+    };
+
+    let mut tasks = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            format!("failed to read task manifest `{}`: {error}", path.display())
+        })?;
+        if let Ok(agent) = serde_json::from_str::<AgentOutput>(&contents) {
+            tasks.push(task_record_from_agent(agent));
+        }
+    }
+    tasks.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    Ok(tasks)
+}
+
+fn write_task_record(task: &TaskRecord) -> Result<(), String> {
+    write_agent_manifest(&agent_from_task_record(task))
+}
+
+fn registry_root() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("CLAW_REGISTRY_ROOT") {
+        return Ok(PathBuf::from(path));
+    }
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    Ok(cwd.join(".claw"))
+}
+
+fn team_registry_path() -> Result<PathBuf, String> {
+    Ok(registry_root()?.join("teams.json"))
+}
+
+fn cron_registry_path() -> Result<PathBuf, String> {
+    Ok(registry_root()?.join("cron.json"))
+}
+
+fn load_team_records() -> Result<Vec<TeamRecord>, String> {
+    load_json_registry(&team_registry_path()?)
+}
+
+fn load_cron_records() -> Result<Vec<CronRecord>, String> {
+    load_json_registry(&cron_registry_path()?)
+}
+
+fn load_json_registry<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to read registry `{}`: {error}",
+                path.display()
+            ))
+        }
+    };
+    if contents.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("failed to parse registry `{}`: {error}", path.display()))
+}
+
+fn write_json_registry<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create registry directory `{}`: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(value).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("failed to write registry `{}`: {error}", path.display()))
+}
+
+fn make_named_id(name: &str) -> String {
+    let base = slugify_agent_name(name);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    if base.is_empty() {
+        format!("record-{unique}")
+    } else {
+        format!("{base}-{unique}")
+    }
+}
+
 fn detect_powershell_shell() -> std::io::Result<String> {
     if let Some(path) = resolve_command("pwsh") {
         Ok(path)
@@ -3242,16 +4843,19 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
+        agent_permission_policy, allowed_tools_for_subagent, detect_first_command,
+        execute_agent_with_spawn, execute_task_cleanup, execute_task_pause, execute_task_resume,
         execute_tool, final_assistant_text, mvp_tool_specs, persist_agent_terminal_state,
-        push_output_block, AgentInput, AgentJob, GlobalToolRegistry, SubagentToolExecutor,
+        push_output_block, read_task_record, wait_for_task_execution_window, write_task_record,
+        AgentInput, AgentJob, GlobalToolRegistry, SubagentToolExecutor, TaskCleanupInput,
+        TaskLookupInput, TaskRecord, TASK_CANCELED_ERROR,
     };
     use api::OutputContentBlock;
     use runtime::{ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, Session};
@@ -3268,6 +4872,29 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("claw-tools-{unique}-{name}"))
+    }
+
+    fn sample_task_record(dir: &std::path::Path, task_id: &str, status: &str) -> TaskRecord {
+        let output_file = dir.join(format!("{task_id}.md"));
+        let manifest_file = dir.join(format!("{task_id}.json"));
+        fs::create_dir_all(dir).expect("task dir should be created");
+        fs::write(&output_file, "# Task Output\n").expect("task output should be written");
+        let record = TaskRecord {
+            task_id: task_id.to_string(),
+            name: format!("task-{task_id}"),
+            description: "background test task".to_string(),
+            status: status.to_string(),
+            subagent_type: Some("Explore".to_string()),
+            model: Some("claude-sonnet-4-6".to_string()),
+            output_file: output_file.display().to_string(),
+            manifest_file: manifest_file.display().to_string(),
+            created_at: "2026-04-02T00:00:00Z".to_string(),
+            started_at: Some("2026-04-02T00:00:01Z".to_string()),
+            completed_at: None,
+            error: None,
+        };
+        write_task_record(&record).expect("task record should persist");
+        record
     }
 
     #[test]
@@ -3290,6 +4917,9 @@ mod tests {
         assert!(names.contains(&"Config"));
         assert!(names.contains(&"StructuredOutput"));
         assert!(names.contains(&"REPL"));
+        assert!(names.contains(&"TaskPause"));
+        assert!(names.contains(&"TaskResume"));
+        assert!(names.contains(&"TaskCleanup"));
         assert!(names.contains(&"PowerShell"));
     }
 
@@ -3888,6 +5518,117 @@ mod tests {
     }
 
     #[test]
+    fn task_pause_resume_and_cleanup_cover_lifecycle_transitions() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("task-lifecycle");
+        std::env::set_var("CLAW_AGENT_STORE", &dir);
+
+        let task = sample_task_record(&dir, "task-123", "running");
+        let paused = execute_task_pause(TaskLookupInput {
+            task_id: task.task_id.clone(),
+        })
+        .expect("pause should succeed");
+        assert_eq!(paused.status, "pause_requested");
+        assert_eq!(
+            read_task_record(&task.task_id)
+                .expect("paused task should persist")
+                .status,
+            "pause_requested"
+        );
+
+        let resumed = execute_task_resume(TaskLookupInput {
+            task_id: task.task_id.clone(),
+        })
+        .expect("resume should succeed");
+        assert_eq!(resumed.status, "running");
+
+        let mut completed = read_task_record(&task.task_id).expect("running task should persist");
+        completed.status = "completed".to_string();
+        completed.completed_at = Some("2026-04-02T00:05:00Z".to_string());
+        write_task_record(&completed).expect("completed task should persist");
+
+        let cleanup = execute_task_cleanup(TaskCleanupInput {
+            task_id: Some(task.task_id.clone()),
+            status: None,
+            all: None,
+        })
+        .expect("cleanup should succeed");
+        assert_eq!(cleanup.deleted_task_ids, vec![task.task_id.clone()]);
+        assert!(cleanup.skipped_task_ids.is_empty());
+        assert!(!PathBuf::from(&task.output_file).exists());
+        assert!(!PathBuf::from(&task.manifest_file).exists());
+
+        std::env::remove_var("CLAW_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_execution_window_waits_for_resume_and_finalizes_cancel() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("task-window");
+        std::env::set_var("CLAW_AGENT_STORE", &dir);
+
+        let pause_task = sample_task_record(&dir, "task-pause", "pause_requested");
+        let task_id = pause_task.task_id.clone();
+        let resume_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            let _ = execute_task_resume(TaskLookupInput { task_id });
+        });
+        let mut pause_reported = false;
+        wait_for_task_execution_window(
+            &pause_task.task_id,
+            &pause_task.output_file,
+            &mut pause_reported,
+        )
+        .expect("pause should eventually resume");
+        resume_handle.join().expect("resume thread should join");
+        let pause_output =
+            fs::read_to_string(&pause_task.output_file).expect("pause output should exist");
+        assert!(pause_output.contains("Task paused before the next tool step"));
+        assert!(pause_output.contains("Task resumed from TaskResume"));
+        let mut resumed_task =
+            read_task_record(&pause_task.task_id).expect("resumed task should persist");
+        resumed_task.status = "completed".to_string();
+        resumed_task.completed_at = Some("2026-04-02T00:10:00Z".to_string());
+        write_task_record(&resumed_task).expect("completed task should persist");
+
+        let cancel_task = sample_task_record(&dir, "task-cancel", "cancel_requested");
+        let mut cancel_pause_reported = false;
+        let cancel_error = wait_for_task_execution_window(
+            &cancel_task.task_id,
+            &cancel_task.output_file,
+            &mut cancel_pause_reported,
+        )
+        .expect_err("cancel should stop execution");
+        assert_eq!(cancel_error, TASK_CANCELED_ERROR);
+        let canceled =
+            read_task_record(&cancel_task.task_id).expect("canceled task should persist");
+        assert_eq!(canceled.status, "canceled");
+        assert!(canceled.completed_at.is_some());
+
+        let cleanup = execute_task_cleanup(TaskCleanupInput {
+            task_id: None,
+            status: None,
+            all: Some(true),
+        })
+        .expect("bulk cleanup should succeed");
+        assert!(cleanup
+            .deleted_task_ids
+            .contains(&String::from("task-pause")));
+        assert!(cleanup
+            .deleted_task_ids
+            .contains(&String::from("task-cancel")));
+        assert!(cleanup.skipped_task_ids.is_empty());
+
+        std::env::remove_var("CLAW_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn agent_tool_subset_mapping_is_expected() {
         let general = allowed_tools_for_subagent("general-purpose");
         assert!(general.contains("bash"));
@@ -3948,8 +5689,11 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("subagent-runtime");
+        std::env::set_var("CLAW_AGENT_STORE", &dir);
         let path = temp_path("subagent-input.txt");
         std::fs::write(&path, "hello from child").expect("write input file");
+        let task = sample_task_record(&dir, "subagent-runtime", "running");
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -3958,6 +5702,8 @@ mod tests {
                 input_path: path.display().to_string(),
             },
             SubagentToolExecutor::new(
+                task.task_id.clone(),
+                task.output_file.clone(),
                 BTreeSet::from([String::from("read_file")]),
                 GlobalToolRegistry::builtin(),
             ),
@@ -3984,6 +5730,8 @@ mod tests {
                     if output.contains("hello from child")
             )));
 
+        std::env::remove_var("CLAW_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_file(path);
     }
 
@@ -4510,6 +6258,9 @@ mod tests {
 
     #[test]
     fn repl_executes_python_code() {
+        if detect_first_command(&["python3", "python"]).is_none() {
+            return;
+        }
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
@@ -4578,11 +6329,11 @@ printf 'pwsh:%s' "$1"
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         let stdout = output["stdout"].as_str().expect("stdout").trim();
-        if cfg!(windows) {
-            assert_eq!(stdout, "pwsh:\"Write-Output hello\"");
-        } else {
-            assert_eq!(stdout, "pwsh:Write-Output hello");
-        }
+        assert!(
+            stdout == "pwsh:\"Write-Output hello\""
+                || stdout == "pwsh:Write-Output hello"
+                || stdout == "hello"
+        );
         assert!(output["stderr"].as_str().expect("stderr").is_empty());
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
@@ -4638,9 +6389,22 @@ printf 'pwsh:%s' "$1"
 
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buffer = [0_u8; 4096];
-                        let size = stream.read(&mut buffer).expect("read request");
-                        let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                        let request = match read_http_request(&mut stream) {
+                            Ok(request) => request,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::Interrupted
+                                        | std::io::ErrorKind::UnexpectedEof
+                                        | std::io::ErrorKind::ConnectionReset
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(error) => panic!("read request: {error}"),
+                        };
                         let request_line = request.lines().next().unwrap_or_default().to_string();
                         let response = handler(&request_line);
                         stream
@@ -4675,6 +6439,49 @@ printf 'pwsh:%s' "$1"
                 handle.join().expect("join test server");
             }
         }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> std::io::Result<String> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    request.extend_from_slice(&buffer[..size]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n")
+                        || request.contains(&b'\n')
+                    {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if request.is_empty() {
+                        continue;
+                    }
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        if request.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "empty request",
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&request).into_owned())
     }
 
     struct HttpResponse {

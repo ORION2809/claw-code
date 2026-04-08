@@ -13,8 +13,6 @@ use serde_json::{json, Value};
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
-pub type HookPermissionDecision = Option<PermissionOverride>;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     PreToolUse,
@@ -615,7 +613,7 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)

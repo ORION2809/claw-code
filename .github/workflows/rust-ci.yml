@@ -1,0 +1,77 @@
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --check
+
+      - name: Run workspace tests
+        run: cargo test --workspace -- --test-threads=1
+
+  cli-artifacts:
+    name: CLI artifacts
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Generate shell completions
+        run: |
+          cargo run -p claw-cli -- completions bash --output target/dist/claw.bash
+          cargo run -p claw-cli -- completions zsh --output target/dist/_claw
+          cargo run -p claw-cli -- completions fish --output target/dist/claw.fish
+          cargo run -p claw-cli -- completions powershell --output target/dist/claw.ps1
+          cargo run -p claw-cli -- completions elvish --output target/dist/claw.elv
+
+      - name: Generate man page
+        run: cargo run -p claw-cli -- manpage --output target/dist/claw.1
+
+      - name: Upload CLI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: claw-cli-artifacts
+          path: rust/target/dist/*

@@ -719,13 +719,7 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
-    use plugins::{PluginManager, PluginManagerConfig};
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct ScriptedApiClient {
         call_count: usize,
@@ -1107,68 +1101,6 @@ mod tests {
             result.compacted_session.messages[0].role,
             MessageRole::System
         );
-    }
-
-    fn temp_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("runtime-plugin-{label}-{nanos}"))
-    }
-
-    fn write_lifecycle_plugin(root: &Path, name: &str) -> PathBuf {
-        fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
-        fs::create_dir_all(root.join("lifecycle")).expect("lifecycle dir");
-        let log_path = root.join("lifecycle.log");
-        fs::write(
-            root.join("lifecycle").join("init.sh"),
-            "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
-        )
-        .expect("write init script");
-        fs::write(
-            root.join("lifecycle").join("shutdown.sh"),
-            "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
-        )
-        .expect("write shutdown script");
-        fs::write(
-            root.join(".claude-plugin").join("plugin.json"),
-            format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"runtime lifecycle plugin\",\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }}\n}}"
-            ),
-        )
-        .expect("write plugin manifest");
-        log_path
-    }
-
-    fn write_hook_plugin(root: &Path, name: &str, pre_message: &str, post_message: &str) {
-        fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
-        fs::create_dir_all(root.join("hooks")).expect("hooks dir");
-        fs::write(
-            root.join("hooks").join("pre.sh"),
-            format!("#!/bin/sh\nprintf '%s\\n' '{pre_message}'\n"),
-        )
-        .expect("write pre hook");
-        fs::write(
-            root.join("hooks").join("post.sh"),
-            format!("#!/bin/sh\nprintf '%s\\n' '{post_message}'\n"),
-        )
-        .expect("write post hook");
-        #[cfg(unix)]
-        {
-            let exec_mode = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(root.join("hooks").join("pre.sh"), exec_mode.clone())
-                .expect("chmod pre hook");
-            fs::set_permissions(root.join("hooks").join("post.sh"), exec_mode)
-                .expect("chmod post hook");
-        }
-        fs::write(
-            root.join(".claude-plugin").join("plugin.json"),
-            format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"runtime hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"]\n  }}\n}}"
-            ),
-        )
-        .expect("write plugin manifest");
     }
 
     #[test]

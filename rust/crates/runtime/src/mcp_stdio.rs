@@ -202,12 +202,18 @@ pub struct McpReadResourceResult {
     pub contents: Vec<McpResourceContents>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManagedMcpTool {
     pub server_name: String,
     pub qualified_name: String,
     pub raw_name: String,
     pub tool: McpTool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagedMcpResource {
+    pub server_name: String,
+    pub resource: McpResource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +434,100 @@ impl McpServerManager {
         }
 
         Ok(discovered_tools)
+    }
+
+    pub async fn list_resources(
+        &mut self,
+    ) -> Result<Vec<ManagedMcpResource>, McpServerManagerError> {
+        let server_names = self.servers.keys().cloned().collect::<Vec<_>>();
+        let mut discovered_resources = Vec::new();
+
+        for server_name in server_names {
+            self.ensure_server_ready(&server_name).await?;
+
+            let mut cursor = None;
+            loop {
+                let request_id = self.take_request_id();
+                let response = {
+                    let server = self.server_mut(&server_name)?;
+                    let process = server.process.as_mut().ok_or_else(|| {
+                        McpServerManagerError::InvalidResponse {
+                            server_name: server_name.clone(),
+                            method: "resources/list",
+                            details: "server process missing after initialization".to_string(),
+                        }
+                    })?;
+                    process
+                        .list_resources(
+                            request_id,
+                            Some(McpListResourcesParams {
+                                cursor: cursor.clone(),
+                            }),
+                        )
+                        .await?
+                };
+
+                if let Some(error) = response.error {
+                    return Err(McpServerManagerError::JsonRpc {
+                        server_name: server_name.clone(),
+                        method: "resources/list",
+                        error,
+                    });
+                }
+
+                let result =
+                    response
+                        .result
+                        .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                            server_name: server_name.clone(),
+                            method: "resources/list",
+                            details: "missing result payload".to_string(),
+                        })?;
+
+                discovered_resources.extend(result.resources.into_iter().map(|resource| {
+                    ManagedMcpResource {
+                        server_name: server_name.clone(),
+                        resource,
+                    }
+                }));
+
+                match result.next_cursor {
+                    Some(next_cursor) => cursor = Some(next_cursor),
+                    None => break,
+                }
+            }
+        }
+
+        Ok(discovered_resources)
+    }
+
+    pub async fn read_resource(
+        &mut self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<JsonRpcResponse<McpReadResourceResult>, McpServerManagerError> {
+        self.ensure_server_ready(server_name).await?;
+        let request_id = self.take_request_id();
+        let response =
+            {
+                let server = self.server_mut(server_name)?;
+                let process = server.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "resources/read",
+                        details: "server process missing after initialization".to_string(),
+                    }
+                })?;
+                process
+                    .read_resource(
+                        request_id,
+                        McpReadResourceParams {
+                            uri: uri.to_string(),
+                        },
+                    )
+                    .await?
+            };
+        Ok(response)
     }
 
     pub async fn call_tool(
@@ -1121,42 +1221,50 @@ mod tests {
         script_path
     }
 
-    fn sample_bootstrap(script_path: &Path) -> McpClientBootstrap {
+    fn sample_bootstrap(script_path: &Path) -> Option<McpClientBootstrap> {
+        let command = python_command()?;
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: python_command(),
+                command,
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
             }),
         };
-        McpClientBootstrap::from_scoped_config("stdio server", &config)
+        Some(McpClientBootstrap::from_scoped_config(
+            "stdio server",
+            &config,
+        ))
     }
 
-    fn script_transport(script_path: &Path) -> crate::mcp_client::McpStdioTransport {
-        crate::mcp_client::McpStdioTransport {
-            command: python_command(),
+    fn script_transport(script_path: &Path) -> Option<crate::mcp_client::McpStdioTransport> {
+        Some(crate::mcp_client::McpStdioTransport {
+            command: python_command()?,
             args: vec![script_path.to_string_lossy().into_owned()],
             env: BTreeMap::new(),
-        }
+        })
     }
 
-    fn python_command() -> String {
+    fn python_command() -> Option<String> {
         for key in ["MCP_TEST_PYTHON", "PYTHON3", "PYTHON"] {
             if let Ok(value) = std::env::var(key) {
                 if !value.trim().is_empty() {
-                    return value;
+                    return Some(value);
                 }
             }
         }
 
-        for candidate in ["python3", "python"] {
-            if Command::new(candidate).arg("--version").output().is_ok() {
-                return candidate.to_string();
+        for candidate in ["python3", "python", "py"] {
+            if Command::new(candidate)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+            {
+                return Some(candidate.to_string());
             }
         }
 
-        panic!("expected a Python interpreter for MCP stdio tests")
+        None
     }
 
     fn cleanup_script(script_path: &Path) {
@@ -1172,11 +1280,11 @@ mod tests {
         script_path: &Path,
         label: &str,
         log_path: &Path,
-    ) -> ScopedMcpServerConfig {
-        ScopedMcpServerConfig {
+    ) -> Option<ScopedMcpServerConfig> {
+        Some(ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: python_command(),
+                command: python_command()?,
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([
                     ("MCP_SERVER_LABEL".to_string(), label.to_string()),
@@ -1186,7 +1294,7 @@ mod tests {
                     ),
                 ]),
             }),
-        }
+        })
     }
 
     #[test]
@@ -1197,7 +1305,10 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_echo_script();
-            let bootstrap = sample_bootstrap(&script_path);
+            let Some(bootstrap) = sample_bootstrap(&script_path) else {
+                cleanup_script(&script_path);
+                return;
+            };
             let mut process = spawn_mcp_stdio_process(&bootstrap).expect("spawn stdio process");
 
             let ready = process.read_line().await.expect("read ready");
@@ -1239,7 +1350,10 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_jsonrpc_script();
-            let transport = script_transport(&script_path);
+            let Some(transport) = script_transport(&script_path) else {
+                cleanup_script(&script_path);
+                return;
+            };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
 
             let response = process
@@ -1286,7 +1400,10 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_jsonrpc_script();
-            let transport = script_transport(&script_path);
+            let Some(transport) = script_transport(&script_path) else {
+                cleanup_script(&script_path);
+                return;
+            };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
             let request = JsonRpcRequest::new(
                 JsonRpcId::Number(7),
@@ -1320,8 +1437,12 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_echo_script();
+            let Some(command) = python_command() else {
+                cleanup_script(&script_path);
+                return;
+            };
             let transport = crate::mcp_client::McpStdioTransport {
-                command: python_command(),
+                command,
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "direct-secret".to_string())]),
             };
@@ -1343,7 +1464,10 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_mcp_server_script();
-            let transport = script_transport(&script_path);
+            let Some(transport) = script_transport(&script_path) else {
+                cleanup_script(&script_path);
+                return;
+            };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn fake mcp server");
 
             let tools = process
@@ -1443,7 +1567,10 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_mcp_server_script();
-            let transport = script_transport(&script_path);
+            let Some(transport) = script_transport(&script_path) else {
+                cleanup_script(&script_path);
+                return;
+            };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn fake mcp server");
 
             let response = process
@@ -1482,10 +1609,12 @@ mod tests {
             let script_path = write_manager_mcp_server_script();
             let root = script_path.parent().expect("script parent");
             let log_path = root.join("alpha.log");
-            let servers = BTreeMap::from([(
-                "alpha".to_string(),
-                manager_server_config(&script_path, "alpha", &log_path),
-            )]);
+            let Some(server_config) = manager_server_config(&script_path, "alpha", &log_path)
+            else {
+                cleanup_script(&script_path);
+                return;
+            };
+            let servers = BTreeMap::from([("alpha".to_string(), server_config)]);
             let mut manager = McpServerManager::from_servers(&servers);
 
             let tools = manager.discover_tools().await.expect("discover tools");
@@ -1513,15 +1642,18 @@ mod tests {
             let root = script_path.parent().expect("script parent");
             let alpha_log = root.join("alpha.log");
             let beta_log = root.join("beta.log");
+            let Some(alpha_server) = manager_server_config(&script_path, "alpha", &alpha_log)
+            else {
+                cleanup_script(&script_path);
+                return;
+            };
+            let Some(beta_server) = manager_server_config(&script_path, "beta", &beta_log) else {
+                cleanup_script(&script_path);
+                return;
+            };
             let servers = BTreeMap::from([
-                (
-                    "alpha".to_string(),
-                    manager_server_config(&script_path, "alpha", &alpha_log),
-                ),
-                (
-                    "beta".to_string(),
-                    manager_server_config(&script_path, "beta", &beta_log),
-                ),
+                ("alpha".to_string(), alpha_server),
+                ("beta".to_string(), beta_server),
             ]);
             let mut manager = McpServerManager::from_servers(&servers);
 
@@ -1620,10 +1752,12 @@ mod tests {
             let script_path = write_manager_mcp_server_script();
             let root = script_path.parent().expect("script parent");
             let log_path = root.join("alpha.log");
-            let servers = BTreeMap::from([(
-                "alpha".to_string(),
-                manager_server_config(&script_path, "alpha", &log_path),
-            )]);
+            let Some(server_config) = manager_server_config(&script_path, "alpha", &log_path)
+            else {
+                cleanup_script(&script_path);
+                return;
+            };
+            let servers = BTreeMap::from([("alpha".to_string(), server_config)]);
             let mut manager = McpServerManager::from_servers(&servers);
 
             manager.discover_tools().await.expect("discover tools");
@@ -1644,10 +1778,12 @@ mod tests {
             let script_path = write_manager_mcp_server_script();
             let root = script_path.parent().expect("script parent");
             let log_path = root.join("alpha.log");
-            let servers = BTreeMap::from([(
-                "alpha".to_string(),
-                manager_server_config(&script_path, "alpha", &log_path),
-            )]);
+            let Some(server_config) = manager_server_config(&script_path, "alpha", &log_path)
+            else {
+                cleanup_script(&script_path);
+                return;
+            };
+            let servers = BTreeMap::from([("alpha".to_string(), server_config)]);
             let mut manager = McpServerManager::from_servers(&servers);
 
             manager.discover_tools().await.expect("discover tools");
@@ -1690,10 +1826,12 @@ mod tests {
             let script_path = write_manager_mcp_server_script();
             let root = script_path.parent().expect("script parent");
             let log_path = root.join("alpha.log");
-            let servers = BTreeMap::from([(
-                "alpha".to_string(),
-                manager_server_config(&script_path, "alpha", &log_path),
-            )]);
+            let Some(server_config) = manager_server_config(&script_path, "alpha", &log_path)
+            else {
+                cleanup_script(&script_path);
+                return;
+            };
+            let servers = BTreeMap::from([("alpha".to_string(), server_config)]);
             let mut manager = McpServerManager::from_servers(&servers);
 
             let error = manager

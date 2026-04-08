@@ -1,0 +1,54 @@
+name: Rust Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Release binary (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary_name: claw
+            archive_name: claw-linux-x64
+          - os: macos-latest
+            binary_name: claw
+            archive_name: claw-macos-x64
+          - os: windows-latest
+            binary_name: claw.exe
+            archive_name: claw-windows-x64
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build release binary
+        run: cargo build -p claw-cli --release
+
+      - name: Stage release bundle
+        run: |
+          mkdir -p target/release-bundle
+          cp "target/release/${{ matrix.binary_name }}" "target/release-bundle/${{ matrix.binary_name }}"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive_name }}
+          path: rust/target/release-bundle/*
